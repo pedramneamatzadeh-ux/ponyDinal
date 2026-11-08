@@ -1,0 +1,28 @@
+# ── اسرار و پیکربندی ──────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── نشست‌های تلگرام (دسترسی کامل به اکانت‌ها!) ──────
+sessions/
+*.session
+*.session-journal
+
+# ── داده‌های اجرا و کاربران ────────────────────────
+users.json
+banners.json
+stats.json
+runtime.json
+battle_config.json
+gender_banners.json
+errors.log
+temp_files/
+*.log
+
+# ── پایتون ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/

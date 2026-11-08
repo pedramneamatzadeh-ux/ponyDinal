@@ -1,0 +1,5 @@
+# نسخه‌ی telethon پین شده است: در 1.45+ کلاس‌های KeyboardButtonUrl /
+# KeyboardButtonCallback حذف شده‌اند و کد فعلی روی آن خطای ImportError می‌دهد.
+telethon>=1.36,<1.45
+Pillow
+psutil

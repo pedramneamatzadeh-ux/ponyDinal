@@ -7,7 +7,7 @@ def _translate_bot_errors(e):
     return err_text
 
 # -*- coding: utf-8 -*-
-import asyncio, io, json, os, re, time, sys, random, platform
+import asyncio, io, json, os, re, time, sys, random, platform, html as html_lib
 from datetime import datetime, timedelta
 from pathlib import Path
 from difflib import get_close_matches
@@ -18,11 +18,45 @@ from telethon.tl.functions.messages import (
     GetInlineBotResultsRequest, SendInlineBotResultRequest,
     EditInlineBotMessageRequest)
 from telethon.tl.functions.contacts import ResolveUsernameRequest
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.photos import UpdateProfilePhotoRequest
 from telethon.tl.types import (
     ReplyInlineMarkup, KeyboardButtonRow, KeyboardButtonUrl,
     MessageMediaDocument, DocumentAttributeFilename, DocumentAttributeAudio,
-    InputBotInlineResult, InputBotInlineMessageText,
 )
+
+# آیا InputBotInlineMessageMediaAuto پارامتر media را می‌پذیرد؟
+try:
+    import inspect as _inspect
+    from telethon.tl.types import (
+        InputBotInlineMessageMediaAuto as _IBIMA)
+    _INLINE_MEDIA_SUPPORTED = (
+        "media" in _inspect.signature(_IBIMA.__init__).parameters)
+except Exception:  # pragma: no cover
+    _INLINE_MEDIA_SUPPORTED = False
+
+
+# ═══════════════════════════════════════════════════════
+# تسک‌های پس‌زمینه — رفرنس نگه می‌داریم تا GC وسط کار جمع‌شان نکند
+# ═══════════════════════════════════════════════════════
+_BG_TASKS = set()
+
+
+def _spawn(coro):
+    """جایگزین امن asyncio.create_task برای تسک‌هایی که رفرنس نگه نمی‌داریم."""
+    try:
+        task = asyncio.ensure_future(coro)
+    except RuntimeError:
+        return None
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+def _bg_task_count():
+    return len(_BG_TASKS)
+
 
 # ═══════════════════════════════════════════════════════
 # بارگذاری متغیرهای محیطی از فایل .env (بدون وابستگی خارجی)
@@ -103,7 +137,7 @@ GENDER_DIR = TEMP_DIR / "gender_banners"; GENDER_DIR.mkdir(exist_ok=True)
 USERS_FILE = "users.json"; BANNERS_FILE = "banners.json"
 STATS_FILE = "stats.json"; ERRORS_LOG = "errors.log"; BATTLE_FILE = "battle_config.json"
 GENDER_BANNERS_FILE = "gender_banners.json"
-RUNTIME_FILE = "runtime.json"
+RUNTIME_FILE = "runtime.json"; MONITOR_FILE = "monitor.json"
 CMD = "،"
 GAME_BOT_USERNAME = "CardinalRPG_Bot"; GAME_BOT_ID = 8876785338
 CITY_EXIT_COMMAND = "🏰 خروج از شهر!"
@@ -126,8 +160,6 @@ BANNER_BLUR_RADIUS = 25; BANNER_DARKEN = 0.6
 PEW_TARGET_SHOOT_INTERVAL = 15
 PEW_TARGET_DEATH_WAIT = 11 * 60
 PEW_TARGET_SHOOT_CMD = "شلیک"
-PEW_BOSS_SHOOT_CMD = "شلیک"
-PEW_BOSS_TARGET_PCT = 1
 PEW_HP_HEAL_THRESHOLD = 100
 PEW_HEAL_INTERVAL = 4
 PEW_HEAL_MAX_ATTEMPTS = 100
@@ -136,15 +168,19 @@ PERSIAN_DIGITS_TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
 # استایل‌ها و فونت‌ها
 # ═══════════════════════════════════════════════════════
 HTML_STYLES = {
-    "none":      {"label": "❌ بدون استایل", "open": "", "close": ""},
-    "bold":      {"label": "🅱️ بولد",        "open": "<b>", "close": "</b>"},
-    "italic":    {"label": "ℹ️ ایتالیک",      "open": "<i>", "close": "</i>"},
-    "underline": {"label": "🇺 زیر خط",       "open": "<u>", "close": "</u>"},
-    "strike":    {"label": "🇸 رو خط",        "open": "<s>", "close": "</s>"},
-    "code":      {"label": "💻 کد",           "open": "<code>", "close": "</code>"},
-    "pre":       {"label": "📦 بلوک کد",      "open": "<pre>", "close": "</pre>"},
-    "quote":     {"label": "💬 نقل قول",      "open": "<blockquote>", "close": "</blockquote>"},
-    "spoiler":   {"label": "🙈 اسپویلر",      "open": "<tg-spoiler>", "close": "</tg-spoiler>"},
+    "none":       {"label": "❌ بدون استایل", "open": "", "close": ""},
+    "bold":       {"label": "🅱️ پررنگ", "open": "<b>", "close": "</b>"},
+    "italic":     {"label": "ℹ️ کج", "open": "<i>", "close": "</i>"},
+    "bolditalic": {"label": "🅱️ℹ️ پررنگ و کج", "open": "<b><i>", "close": "</i></b>"},
+    "underline":  {"label": "🇺 زیرخط‌دار", "open": "<u>", "close": "</u>"},
+    "strike":     {"label": "🇸 خط‌خورده", "open": "<s>", "close": "</s>"},
+    "spoiler":    {"label": "🙈 اسپویلر", "open": "<tg-spoiler>", "close": "</tg-spoiler>"},
+    "mono":       {"label": "⌨️ تک‌عرض", "open": "<code>", "close": "</code>"},
+    "code":       {"label": "📦 بلوک کد", "open": "<pre>", "close": "</pre>"},
+    "quote":      {"label": "💬 نقل‌قول", "open": "<blockquote>", "close": "</blockquote>"},
+    "kashida":    {"label": "〰️ کشیده", "open": "", "close": ""},
+    # Legacy alias retained for users who previously selected `.استایل pre`.
+    "pre":        {"label": "📦 بلوک کد (قدیمی)", "open": "<pre>", "close": "</pre>"},
 }
 EN_LOWER = "abcdefghijklmnopqrstuvwxyz"
 EN_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -208,10 +244,27 @@ def load_json(filename, default=None):
     except: return {} if default is None else default
 
 def save_json(filename, data):
+    """ذخیرهٔ اتمیک JSON؛ خطا هرگز باعث کرش هندلرها نمی‌شود."""
     tmp = filename + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, filename)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, filename)
+        return True
+    except TypeError:
+        # دادهٔ غیرقابل‌سریالایز (مثلاً آبجکت تلگرام) → رشته‌ای ذخیره می‌شود
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+            os.replace(tmp, filename)
+            log_error(f"save_json fallback(default=str) for {filename}")
+            return True
+        except Exception as e:
+            log_error(f"save_json fallback {filename}: {_translate_bot_errors(e)}")
+            return False
+    except Exception as e:
+        log_error(f"save_json {filename}: {_translate_bot_errors(e)}")
+        return False
 
 def log_error(msg):
     try:
@@ -284,6 +337,7 @@ battle_db = load_json(BATTLE_FILE, {})
 if "chats" not in battle_db:
     battle_db = {"chats": {}}; save_json(BATTLE_FILE, battle_db)
 gender_banners_db = load_json(GENDER_BANNERS_FILE, {"girl": [], "boy": []})
+monitor_db = load_json(MONITOR_FILE, {})
 if "girl" not in gender_banners_db: gender_banners_db["girl"] = []
 if "boy" not in gender_banners_db: gender_banners_db["boy"] = []
 
@@ -315,21 +369,26 @@ team_attack_ready = {}; team_attack_pending = {}
 defense_pending = {}
 pony_config = {}
 transfer_materials_config = {}
-transfer_items_config = {}; pony_waiting = {}; pony_tasks = {}; pony_state = {}
+transfer_items_config = {}; transfer_scheduler_tasks = {}
+pony_waiting = {}; pony_tasks = {}; pony_state = {}; naz_auto_tasks = {}
 dungeon_config = {}; dungeon_tasks = {}; dungeon_waiting = {}
 hunt_floor_state = {}; ally_paused = {}; yes_retry_state = {}
 floor_test_config = {}; hunt_fail_counter = {}; pm_banner_states = {}
+# Opaque callback tokens bind every inline panel button to its originating account.
+panel_callback_tokens = {}
+pm_banner_add_timeout_tasks = {}
 pew_art_config = {}; pew_art_stats = {}; pew_art_pending = {}
 pew_ring_config = {}; pew_ring_state = {}; pew_ring_tasks = {}
 pew_target_config = {}; pew_target_tasks = {}; pew_target_state = {}
 pew_dog_config = {}; pew_dog_tasks = {}; pew_dog_state = {}
 pew_master = {}
-pew_boss_config = {}
-pew_boss_shot = {}
-pew_boss_stats = {}
 pew_heal_tasks = {}
 _CURRENT_INLINE = {}
 pm_panel_chat = {}
+name_emoji_tasks = {}
+random_profile_tasks = {}
+monitor_tasks = {}
+NAME_EMOJI_PRESETS = ["🌸", "💖", "✨", "🌙", "🦋", "💫", "🌈", "🍀"]
 fishing_status = {}
 fishing_tasks = {}
 user_current_floor = {}
@@ -408,13 +467,13 @@ def save_runtime():
             "pew_dog_config": {_tk(k): dict(v) for k, v in pew_dog_config.items()},
             "pew_dog_state": {_tk(k): dict(v) for k, v in pew_dog_state.items()},
             "pew_master": {str(k): dict(v) for k, v in pew_master.items()},
-            "pew_boss_config": {str(k): dict(v) for k, v in pew_boss_config.items()},
-            "pew_boss_stats": {str(k): dict(v) for k, v in pew_boss_stats.items()},
             "pm_panel_chat": {str(k): v for k, v in pm_panel_chat.items()},
             "pew_hunt_groups": pew_hunt_groups,
             "pew_user_group": {str(k): v for k, v in pew_user_group.items()},
         }
         data["transfer_materials_config"] = {str(k): v for k, v in transfer_materials_config.items()}
+        data["transfer_items_config"] = {
+            str(k): _strip_task(v) for k, v in transfer_items_config.items()}
         save_json(RUNTIME_FILE, data)
     except Exception as e:
         log_error(f"save_runtime: {_translate_bot_errors(e)}")
@@ -486,12 +545,6 @@ def load_runtime():
         for k, v in data.get("pew_master", {}).items():
             try: pew_master[int(k)] = dict(v)
             except: pass
-        for k, v in data.get("pew_boss_config", {}).items():
-            try: pew_boss_config[int(k)] = dict(v)
-            except: pass
-        for k, v in data.get("pew_boss_stats", {}).items():
-            try: pew_boss_stats[int(k)] = dict(v)
-            except: pass
         for k, v in data.get("pm_panel_chat", {}).items():
             try: pm_panel_chat[int(k)] = int(v)
             except: pass
@@ -511,7 +564,7 @@ def load_runtime():
         for k, v in data.get("transfer_items_config", {}).items():
             try: transfer_items_config[int(k)] = dict(v)
             except: pass
-        log_error(f"✅ runtime loaded")
+        log_error("✅ runtime loaded")
     except Exception as e:
         log_error(f"load_runtime: {_translate_bot_errors(e)}")
 
@@ -533,22 +586,27 @@ async def _restart_runtime_tasks():
     await asyncio.sleep(8)
     try:
         for uid, v in list(sell_mode_users.items()):
-            if v.get("enabled") and not v.get("scheduler_task"):
+            _t = v.get("scheduler_task")
+            if v.get("enabled") and (_t is None or _t.done()):
                 sell_mode_users[uid]["scheduler_task"] = asyncio.create_task(sell_scheduler(uid))
         
         for uid, v in list(transfer_items_config.items()):
-            if v.get("enabled") and not sell_mode_users.get(uid, {}).get("enabled"):
-                asyncio.create_task(item_scheduler(uid))
+            if v.get("enabled"):
+                _ensure_transfer_scheduler(uid, "item")
                 
         for uid, v in list(transfer_materials_config.items()):
-            if v.get("enabled") and not sell_mode_users.get(uid, {}).get("enabled"):
-                asyncio.create_task(material_scheduler(uid))
+            if v.get("enabled"):
+                _ensure_transfer_scheduler(uid, "material")
         for uid, v in list(auto_send_status.items()):
             for key, on in v.items():
                 if on and key in AUTO_SEND_CONFIG:
                     try: start_auto_send(uid, key)
                     except: pass
         for uid, cfg in list(transfer_configs.items()):
+            _t = cfg.get("task")
+            if _t is not None and not _t.done():
+                # جلوگیری از دو scheduler هم‌زمان برای یک کاربر (انتقال تکراری)
+                continue
             if cfg.get("enabled") and cfg.get("c_id"):
                 cfg["mode"] = "fast"
                 cfg["task"] = asyncio.create_task(transfer_scheduler(uid))
@@ -556,9 +614,24 @@ async def _restart_runtime_tasks():
             if on:
                 try: start_daily_gift(uid)
                 except: pass
+        for uid, info in list(users_db.get("users", {}).items()):
+            try:
+                if info.get("name_emoji", {}).get("enabled") and is_user_active(int(uid)):
+                    start_name_emoji_task(int(uid))
+                if info.get("random_profile", {}).get("enabled") and is_user_active(int(uid)):
+                    start_random_profile_task(int(uid))
+            except: pass
+        for uid, cfg in list(monitor_db.items()):
+            try:
+                if cfg.get("enabled") and is_user_active(int(uid)):
+                    start_monitor_task(int(uid))
+            except: pass
         for key, cfg in list(pony_config.items()):
             if cfg.get("collect") and is_user_active(key[0]):
                 try: start_pony_task(key[0], key[1])
+                except: pass
+            if cfg.get("naz_enabled") and is_user_active(key[0]):
+                try: start_naz_auto_task(key[0], key[1])
                 except: pass
         for key, cfg in list(dungeon_config.items()):
             if cfg.get("enabled") and is_user_active(key[0]):
@@ -581,7 +654,7 @@ async def _restart_runtime_tasks():
             if cfg.get("enabled") and is_user_active(key[0]):
                 try: start_pew_dog_task(key[0], key[1])
                 except: pass
-        log_error(f"🔄 runtime tasks restarted")
+        log_error("🔄 runtime tasks restarted")
     except Exception as e:
         log_error(f"_restart_runtime_tasks: {_translate_bot_errors(e)}")
         # ═══════════════════════════════════════════════════════
@@ -660,6 +733,7 @@ def get_user_html_style(uid):
     if not u.get("html_style_on", False): return None
     s = u.get("html_style", "bold")
     st = HTML_STYLES.get(s, HTML_STYLES["bold"])
+    if s == "kashida": return st
     if not st["open"]: return None
     return st
 
@@ -732,30 +806,58 @@ def _apply_persian_font_effects(text, font_key):
         return _apply_persian_strike(text)
     return text
 
+def _apply_kashida(text):
+    """Add Arabic tatweel only between join-capable Persian/Arabic letters."""
+    if not text: return text
+    letters = set("ءآأؤإئابةتثجحخدذرزسشصضطظعغفقكلمنهوىيپچژگک")
+    non_joining = set("اآأإدذرزژوؤ")
+    out = []
+    for i, char in enumerate(text):
+        out.append(char)
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if char in letters and char not in non_joining and nxt in letters:
+            out.append("ـ")
+    return "".join(out)
+
+
 def apply_user_style(uid, text):
     if not text: return text
     u = users_db["users"].get(str(uid), {})
+    transformed = False
     if u.get("font_on", False):
         fk = u.get("font", "none")
         if fk != "none":
             font = ENGLISH_FONTS.get(fk)
             if font:
                 text = apply_english_font(text, font)
+                transformed = True
             text = _apply_persian_font_effects(text, fk)
+            transformed = True
     html_s = get_user_html_style(uid)
-    if html_s: text = f"{html_s['open']}{text}{html_s['close']}"
+    if html_s and u.get("html_style") == "kashida":
+        text = html_lib.escape(_apply_kashida(text))
+        transformed = True
+    elif html_s:
+        text = f"{html_s['open']}{html_lib.escape(text)}{html_s['close']}"
+        transformed = True
+    elif transformed:
+        # Avoid treating the user's literal angle brackets as HTML while editing.
+        text = html_lib.escape(text)
     return text
+
 
 def _preview_style_text(key, text):
     if key == "none": return text
     if key == "bold": return apply_english_font(text, ENGLISH_FONTS["bold"])
     if key == "italic": return apply_english_font(text, ENGLISH_FONTS["italic"])
+    if key == "bolditalic": return apply_english_font(text, ENGLISH_FONTS["boldit"])
     if key == "underline": return _apply_persian_underline(text)
     if key == "strike": return _apply_persian_strike(text)
-    if key == "code": return apply_english_font(text, ENGLISH_FONTS["mono"])
-    if key == "pre": return "▤" + apply_english_font(text, ENGLISH_FONTS["mono"]) + "▤"
+    if key == "mono": return apply_english_font(text, ENGLISH_FONTS["mono"])
+    if key in ("code", "pre"): return "▤" + apply_english_font(text, ENGLISH_FONTS["mono"]) + "▤"
     if key == "quote": return "❝" + text + "❞"
     if key == "spoiler": return "▒" + text + "▒"
+    if key == "kashida": return _apply_kashida(text)
     return text
 
 def _preview_font_text(key, text):
@@ -768,16 +870,19 @@ def _preview_font_text(key, text):
 # نقشه نام‌های فارسی → استایل/فونت
 # ═══════════════════════════════════════════════════════
 STYLE_ALIASES = {
-    "none": ["بدون", "هیچ", "خالی", "پاک", "حذف", "none", "normal", "خاموش"],
-    "bold": ["بولد", "پررنگ", "پر رنگ", "ضخیم", "bold", "b"],
-    "italic": ["ایتالیک", "کج", "مورب", "خمیده", "italic", "i"],
-    "underline": ["زیرخط", "زیر خط", "خط‌زیر", "underline", "u", "زیرین"],
-    "strike": ["روخط", "رو خط", "خط‌خورده", "خط خورده", "strike", "s", "خط‌دار"],
-    "code": ["کد", "code", "کدی"],
-    "pre": ["بلوک کد", "بلوک‌کد", "پری", "pre"],
-    "quote": ["نقل قول", "نقل‌قول", "نقلقول", "کوتیشن", "quote", "نقل"],
-    "spoiler": ["اسپویلر", "مخفی", "محرمانه", "spoiler", "پنهان"],
+    "none": ["بدون", "هیچ", "خالی", "پاک", "حذف", "normal", "خاموش"],
+    "bold": ["بولد", "پررنگ", "پر رنگ", "ضخیم"],
+    "italic": ["ایتالیک", "کج", "مورب", "خمیده"],
+    "bolditalic": ["پررنگ و کج", "بولد ایتالیک", "بولد و کج"],
+    "underline": ["زیرخط", "زیر خط", "خط‌زیر", "زیرین"],
+    "strike": ["روخط", "رو خط", "خط‌خورده", "خط خورده", "خط‌دار"],
+    "spoiler": ["مخفی", "محرمانه", "پنهان"],
+    "mono": ["تک‌عرض", "تک عرض", "تکفاصله", "مونو", "monospace"],
+    "code": ["بلوک کد", "کد", "کدی", "pre"],
+    "quote": ["نقل قول", "نقل‌قول", "نقلقول", "کوتیشن", "نقل"],
+    "kashida": ["کشیده", "کَشیده", "تطویل"],
 }
+
 FONT_ALIASES = {
     "none": ["بدون", "هیچ", "خالی", "پاک", "حذف", "none", "normal", "خاموش"],
     "bold": ["بولد", "پررنگ", "پر رنگ", "ضخیم", "bold"],
@@ -970,7 +1075,11 @@ def is_media_allowed(uid):
 
 def set_media_allowed(uid, val):
     uid_s = str(uid); _ensure_user(uid_s)
-    users_db["users"][uid_s]["media_allowed"] = bool(val)
+    user = users_db["users"][uid_s]
+    user["media_allowed"] = bool(val)
+    # Revoking access also turns off saved TTL automation so it cannot resume later.
+    if not val and int(uid) != int(OWNER_ID):
+        user["ttl_enabled"] = False
     save_json(USERS_FILE, users_db)
 
 def get_media_allowed_users():
@@ -991,11 +1100,194 @@ def is_user_allowed(user_id):
     if is_grp_owner(user_id): return True
     user = users_db["users"].get(str(user_id))
     if user is None: return True
-    return not user.get("banned", False)
+    return not user.get("banned", False) and not user.get("all_access_locked", False)
+
+def set_user_access_locked(user_id, locked):
+    uid = str(user_id); _ensure_user(uid)
+    users_db["users"][uid]["all_access_locked"] = bool(locked)
+    save_json(USERS_FILE, users_db)
+
+# ═══════════════════════════════════════════════════════
+# 🔐 قفل تک‌بخشی (هر بخش دکمهٔ قفل مستقل خودش را دارد)
+# کلید قفل = همان دیتای دکمهٔ آن بخش/دکمه (مثل pn_cardinal_panel)
+# ═══════════════════════════════════════════════════════
+SECTION_LOCK_TITLES = {
+    "pn_games": "🎮 بازی",
+    "pn_cardinal_panel": "⚔ کاردینال",
+    "pn_pony_main": "🐴 پونی‌لند",
+    "pn_pew_panel": "🔫 پیوپیو",
+    "pn_war_panel": "⚔ نبرد و حمله",
+    "pn_transfer_menu": "💸 انتقال",
+    "pn_transfer_info": "💰 انتقال پول",
+    "pn_transfer_materials": "📦 انتقال مواد",
+    "pn_transfer_items": "🎁 انتقال کالا",
+    "pn_nosell_panel": "🚫 نفروش",
+    "pn_return_panel": "🔙 برگشت",
+    "pn_floortest_max_panel": "💀 مرگ تست طبقه",
+    "pn_tools": "🛠 ابزارها",
+    "pn_settings": "⚙️ تنظیمات",
+    "pn_status_panel": "📊 وضعیت",
+    "pn_banner_main": "📢 تبچی",
+    "pn_banner_list": "📢 لیست بنرها",
+    "pn_mon_main": "👁 پایش پروفایل",
+    "pn_tts_panel": "🔊 متن و ویس",
+    "pn_html_panel": "🎨 استایل HTML",
+    "pn_font_panel": "🔤 فونت",
+    "pn_ttl_panel": "🔥 TTL",
+    "pn_save_panel": "📥 ذخیره",
+    "pn_name_emoji_panel": "😀 ایموجی اسم",
+    "pn_random_profile_panel": "📷 پروفایل رندوم",
+    "pn_gender_panel": "👤 جنسیت",
+    "pn_notif_panel": "🔔 اعلان‌ها",
+    "pn_pew_art_panel": "🎨 پیو آرت",
+    "pn_pewring_master_panel": "🏋️ پیو رینگ",
+    "pn_dog_master_panel": "🐕 پیو سگ",
+    "pn_pew_target_panel": "🎯 پیو هدف",
+    "pn_group_hunt_panel": "🎯 شکار گروهی",
+    "pn_ghunt_mgmt": "🎯 مدیریت شکار گروهی",
+    "pn_gender_banners_panel": "🖼 مدیریت بنرها",
+}
+
+# دکمه‌هایی که هرگز نباید قفل/مخفی شوند
+_SECTION_LOCK_IGNORE = {"", "pn_noop", "pn_close", "pn_refresh", "pn_owner"}
+# بخش‌های مخصوص مالک که قفل‌کردنشان معنا ندارد
+_SECTION_LOCK_OWNER_PREFIX = (
+    "pn_access_", "pn_users_", "pn_user_", "pn_media_", "pn_managers",
+    "pn_broadcast", "pn_gb_", "pn_banner_edit", "pn_ping", "pn_reload_",
+    "pn_rmsess_", "pn_ban_", "pn_unban_", "pn_addmgr_", "pn_rmmgr_",
+)
+
+
+def get_locked_sections(user_id):
+    """دیکشنری قفل‌های فعال کاربر: {کلید_dکمه: برچسب}"""
+    info = users_db.get("users", {}).get(str(user_id), {}) or {}
+    locks = info.get("locked_sections")
+    if isinstance(locks, dict):
+        return {str(k): str(v) for k, v in locks.items() if str(k).strip()}
+    if isinstance(locks, (list, tuple)):
+        return {str(k): str(k) for k in locks if str(k).strip()}
+    return {}
+
+
+def is_section_locked(user_id, key):
+    try:
+        if is_grp_owner(user_id):
+            return False
+    except Exception:
+        pass
+    key = str(key or "").strip()
+    if not key:
+        return False
+    return key in get_locked_sections(user_id)
+
+
+def set_section_locked(user_id, key, locked, label=""):
+    """قفل/بازکردن یک بخش یا یک دکمهٔ مشخص برای کاربر."""
+    key = str(key or "").strip()
+    if not key:
+        return False
+    uid = str(int(user_id))
+    _ensure_user(uid)
+    info = users_db["users"][uid]
+    locks = get_locked_sections(user_id)
+    if locked:
+        clean = re.sub(r"\s+", " ", str(label or key)).strip()[:48]
+        locks[key] = clean or key
+    else:
+        locks.pop(key, None)
+    info["locked_sections"] = locks
+    save_json(USERS_FILE, users_db)
+    return bool(locked)
+
+
+def clear_section_locks(user_id):
+    uid = str(int(user_id))
+    _ensure_user(uid)
+    users_db["users"][uid]["locked_sections"] = {}
+    save_json(USERS_FILE, users_db)
+
+
+def _panel_lock_label(raw, text=None):
+    """برچسب انسانی برای یک بخش؛ از رجیستری یا خط اول متن پنل."""
+    raw = str(raw or "")
+    title = SECTION_LOCK_TITLES.get(raw)
+    if not title and text:
+        first = str(text).split("\n")[0]
+        first = re.sub(r"<[^>]+>", "", first)
+        first = re.sub(r"\s+", " ", first).strip()
+        if first:
+            title = first[:28]
+    return title or raw
+
+
+def _is_lockable_panel(raw):
+    raw = str(raw or "")
+    if not raw or raw in _SECTION_LOCK_IGNORE:
+        return False
+    if raw.startswith(_SECTION_LOCK_OWNER_PREFIX):
+        return False
+    if raw in SECTION_LOCK_TITLES:
+        return True
+    return raw.endswith(("_panel", "_main", "_menu"))
+
+
+def _filter_locked_sections(uid, kb):
+    """دکمه‌های بخش‌های قفل‌شده را از پنل کاربر حذف می‌کند."""
+    if not kb:
+        return kb
+    try:
+        if is_grp_owner(uid):
+            return kb
+    except Exception:
+        pass
+    locks = get_locked_sections(uid)
+    if not locks:
+        return kb
+    out = []
+    for row in kb:
+        keep = []
+        for button in row:
+            raw = getattr(button, "data", None)
+            if isinstance(raw, bytes):
+                raw = raw.decode(errors="ignore")
+            if raw and str(raw) in locks:
+                continue
+            keep.append(button)
+        if keep:
+            out.append(keep)
+    return out
+
+
+def _locked_command_label(user_id, text):
+    """اگر دستور متنی مربوط به بخش قفل‌شده باشد، برچسب آن بخش را برمی‌گرداند."""
+    if not text:
+        return None
+    pairs = [
+        ((f"{CMD}پنل بازی", f"{CMD}بازی"), "pn_games"),
+        ((f"{CMD}پنل کاردینال", f"{CMD}کاردینال"), "pn_cardinal_panel"),
+        ((f"{CMD}پنل پونی", f"{CMD}پونی"), "pn_pony_main"),
+        ((f"{CMD}پنل پیو", f"{CMD}پیو"), "pn_pew_panel"),
+        ((f"{CMD}پنل تبچی", f"{CMD}تبچی"), "pn_banner_main"),
+        ((f"{CMD}پنل ابزار", f"{CMD}ابزارها", f"{CMD}پنل ابزارها"), "pn_tools"),
+        ((f"{CMD}پنل فونت",), "pn_font_panel"),
+        ((f"{CMD}پنل استایل", f"{CMD}پنل HTML", f"{CMD}استایل", f"{CMD}راهنمای استایل"), "pn_html_panel"),
+        ((f"{CMD}پنل پایش", f"{CMD}پایش"), "pn_mon_main"),
+        ((f"{CMD}پنل ویس", f"{CMD}پنل صدا", f"{CMD}ویس"), "pn_tts_panel"),
+    ]
+    for commands, key in pairs:
+        if text in commands and is_section_locked(user_id, key):
+            return get_locked_sections(user_id).get(key) or SECTION_LOCK_TITLES.get(key, key)
+    return None
 
 def is_user_active(user_id):
+    try:
+        if is_grp_owner(user_id):
+            return True   # مالک همیشه فعال است (حتی اگر رکورد کاربری‌اش کامل نباشد)
+    except Exception:
+        pass
     user = users_db["users"].get(str(user_id))
-    if user and user.get("locally_disabled", False): return False
+    if user and (user.get("locally_disabled", False) or user.get("all_access_locked", False)):
+        return False
     return bool(user and user.get("active", False))
 
 def is_user_locally_disabled(user_id):
@@ -1003,17 +1295,21 @@ def is_user_locally_disabled(user_id):
     return bool(user and user.get("locally_disabled", False))
 
 def _ensure_user(uid):
+    uid = str(uid)
     if uid not in users_db["users"]:
         users_db["users"][uid] = {"banned": False, "active": False,
             "locally_disabled": False, "phone": "", "name": "", "no_sell": [],
             "gender": None, "banner_id": None, "banner_scope": "private",
             "html_style_on": False, "html_style": "bold",
             "font_on": False, "font": "none",
-            "ttl_enabled": False, "ttl_target": "me"}
+            "ttl_enabled": False, "ttl_target": "me",
+            "locked_sections": {}}
     else:
         u = users_db["users"][uid]
         if "ttl_enabled" not in u: u["ttl_enabled"] = False
         if "ttl_target" not in u: u["ttl_target"] = "me"
+        if not isinstance(u.get("locked_sections"), dict): u["locked_sections"] = {}
+    return users_db["users"][uid]
 
 def set_user_active(user_id, active):
     uid = str(user_id); _ensure_user(uid)
@@ -1222,7 +1518,8 @@ def clear_ally_paused(chat_id):
 # ═══════════════════════════════════════════════════════
 def get_pony_cfg(user_id, chat_id):
     return pony_config.setdefault((int(user_id), int(chat_id)),
-        {"collect": False, "upgrade": False})
+        {"collect": False, "upgrade": False,
+         "naz_enabled": False, "naz_interval_mins": 3})
 
 def get_dungeon_cfg(user_id, chat_id):
     return dungeon_config.setdefault((int(user_id), int(chat_id)),
@@ -1231,6 +1528,9 @@ def get_dungeon_cfg(user_id, chat_id):
 
 def stop_all_pony_for_user(user_id):
     uid = int(user_id)
+    for k in [k for k in list(naz_auto_tasks.keys()) if k[0] == uid]:
+        t = naz_auto_tasks.pop(k, None)
+        if t and not t.done(): t.cancel()
     for k in [k for k in list(pony_tasks.keys()) if k[0] == uid]:
         t = pony_tasks.pop(k, None)
         if t and not t.done(): t.cancel()
@@ -1340,6 +1640,32 @@ def _is_inline_id(obj):
         return True
     return True
 
+def _bind_panel_callbacks(kb, panel_user_id):
+    """Issue short opaque callback IDs bound to the account that opened the panel."""
+    kb = _filter_locked_sections(panel_user_id, kb)
+    now = time.time()
+    for token, value in list(panel_callback_tokens.items()):
+        if now - value[2] > 8 * 3600:
+            panel_callback_tokens.pop(token, None)
+    bound = []
+    for row in (kb or []):
+        new_row = []
+        for button in row:
+            if hasattr(button, "data") and hasattr(button, "text"):
+                raw_data = button.data
+                if isinstance(raw_data, bytes):
+                    raw_data = raw_data.decode(errors="ignore")
+                token = f"pc_{random.getrandbits(48):012x}"
+                while token in panel_callback_tokens:
+                    token = f"pc_{random.getrandbits(48):012x}"
+                panel_callback_tokens[token] = (int(panel_user_id), str(raw_data), now)
+                new_row.append(_cb(button.text, token))
+            else:
+                new_row.append(button)
+        bound.append(new_row)
+    return bound
+
+
 def _kb_to_inline_markup(kb):
     if not kb: return None
     rows = []
@@ -1405,6 +1731,14 @@ async def _pm_safe_edit(event, uid, text, kb=None, file_path=None):
         return True
     except Exception as e:
         log_error(f"_pm_safe_edit helper: {_translate_bot_errors(e)}")
+    # آخرین تلاش: متن بدون تگ (اگر HTML مشکل داشته باشد پنل باز هم آپدیت شود)
+    try:
+        plain = re.sub(r"<[^>]+>", "", str(text or ""))
+        plain = html_lib.unescape(plain)
+        await event.edit(plain, buttons=kb)
+        return True
+    except Exception as e:
+        log_error(f"_pm_safe_edit plain fallback: {_translate_bot_errors(e)}")
         return False
 
 async def _pm_edit_with_banner(event, uid, text, kb):
@@ -1456,6 +1790,10 @@ def get_media_ttl(message):
 
 async def _try_ttl_save(user_id, event):
     cfg = get_ttl_config(user_id)
+    if not is_media_allowed(user_id):
+        if cfg["enabled"]:
+            set_ttl_config(user_id, "enabled", False)
+        return False
     if not cfg["enabled"]: return False
     if not event.is_private: return False
     if event.sender_id == user_id: return False
@@ -1511,9 +1849,9 @@ async def _try_ttl_save(user_id, event):
         f.name = f"ttl_{event.id}{ext}"
         target = cfg["target"] or "me"
         if is_voice:
-            await client.send_file(target, f, caption=cap, voice_note=True, silent=True)
+            await client.send_file(target, f, caption=cap, voice_note=True, silent=True, parse_mode=None)
         else:
-            await client.send_file(target, f, caption=cap, silent=True)
+            await client.send_file(target, f, caption=cap, silent=True, parse_mode=None)
         log_error(f"✅ TTL saved: user={user_id} from={event.sender_id} type={typ} ttl={ttl}")
     except Exception as e:
         log_error(f"_try_ttl_save {user_id}: {_translate_bot_errors(e)}")
@@ -1523,13 +1861,29 @@ async def _try_ttl_save(user_id, event):
 
 def _extract_tg_links(text):
     if not text: return []
+    # Drop trailing punctuation copied from prose while retaining Telegram paths.
     pattern = r'(?:https?://)?t\.me/(?:c/)?[^/\s]+/\d+'
-    return re.findall(pattern, text)
+    links = re.findall(pattern, text, flags=re.IGNORECASE)
+    return [link.rstrip(".,;:!?،؛.)]}") for link in links]
+
+def _get_source_media_caption(message):
+    """Return the original text/caption attached to a media message, if any."""
+    if not message:
+        return ""
+    for attr in ("message", "raw_text", "text"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
 
 async def _download_and_save_media(client, message, caption=None):
+    file_path = None
     try:
         if not message or not message.media:
             return "❌ رسانه ندارد"
+        source_caption = _get_source_media_caption(message)
+        saved_caption = source_caption or caption or "📥 ذخیره شده"
         file_size = 5 * 1024 * 1024
         try:
             if hasattr(message.media, 'document') and hasattr(message.media.document, 'size'):
@@ -1545,9 +1899,13 @@ async def _download_and_save_media(client, message, caption=None):
         )
         if not file_path:
             return "❌ دانلود ناموفق"
-        await client.send_file("me", file_path, caption=caption or "📥 ذخیره شده", silent=True)
-        try: os.remove(file_path)
-        except: pass
+        if len(saved_caption) <= 1024:
+            await client.send_file("me", file_path, caption=saved_caption, silent=True, parse_mode=None)
+        else:
+            # Telegram captions are limited; keep the full original text as a following Saved Message.
+            await client.send_file("me", file_path, caption="📥 ذخیره شده", silent=True, parse_mode=None)
+            for offset in range(0, len(saved_caption), 4000):
+                await client.send_message("me", saved_caption[offset:offset + 4000], silent=True, parse_mode=None)
         return "✅ ذخیره شد"
     except asyncio.TimeoutError:
         return "❌ زمان دانلود تمام شد"
@@ -1555,6 +1913,10 @@ async def _download_and_save_media(client, message, caption=None):
         return f"⏱ باید {e.seconds} ثانیه صبر کنی"
     except Exception as e:
         return f"❌ خطا: {_translate_bot_errors(e)[:80]}"
+    finally:
+        if file_path:
+            try: os.remove(file_path)
+            except: pass
 
 async def _get_album_messages(client, message):
     if not message: return []
@@ -1564,7 +1926,7 @@ async def _get_album_messages(client, message):
         chat_id = message.chat_id or message.peer_id
         album = []
         async for m in client.iter_messages(
-            chat_id, min_id=message.id - 1, max_id=message.id + 15, reverse=True):
+            chat_id, min_id=max(0, message.id - 15), max_id=message.id + 16, reverse=True):
             mg = getattr(m, 'grouped_id', None)
             if mg == gid and m.media:
                 album.append(m)
@@ -1580,9 +1942,9 @@ async def _get_album_messages(client, message):
         log_error(f"_get_album_messages: {_translate_bot_errors(e)}")
         return [message]
 
-async def _process_save_link(client, link):
+async def _process_save_link(client, link, seen_albums=None):
     pattern = r'(?:https?://)?t\.me/(?:c/)?([^/]+)/(\d+)'
-    m = re.search(pattern, link)
+    m = re.search(pattern, link, flags=re.IGNORECASE)
     if not m: return link, "❌ لینک نامعتبر"
     chat_id_str, msg_id_str = m.group(1), m.group(2)
     try: msg_id = int(msg_id_str)
@@ -1595,12 +1957,37 @@ async def _process_save_link(client, link):
         msg = await client.get_messages(entity, ids=msg_id)
         if not msg: return link, "❌ پیدا نشد"
         if not msg.media: return link, "❌ رسانه ندارد"
-        result = await _download_and_save_media(client, msg, "📥 ذخیره شده از لینک")
-        return link, result
+        album = await _get_album_messages(client, msg)
+        if not album: album = [msg]
+        grouped_id = getattr(msg, "grouped_id", None)
+        album_key = (str(getattr(msg, "chat_id", chat_id_str)), str(grouped_id)) if grouped_id else None
+        if album_key and seen_albums is not None:
+            if album_key in seen_albums:
+                return link, "↪️ این آلبوم قبلاً از لینک دیگری ذخیره شد"
+            seen_albums.add(album_key)
+        if len(album) == 1:
+            result = await _download_and_save_media(client, album[0], "📥 ذخیره شده از لینک")
+            return link, result
+        ok = 0
+        for item in album:
+            result = await _download_and_save_media(client, item, "📥 ذخیره شده از لینک")
+            if result.startswith("✅"): ok += 1
+        return link, f"✅ {ok} از {len(album)} رسانه آلبوم ذخیره شد"
     except Exception as e:
         return link, f"❌ خطا: {_translate_bot_errors(e)[:60]}"
 
+
+async def _process_save_links(client, links):
+    seen_albums = set()
+    results = []
+    for link in links:
+        results.append(await _process_save_link(client, link, seen_albums))
+    return results
+
 async def _handle_save_command(event, user_id, raw_arg):
+    if not is_media_allowed(user_id):
+        await safe_edit(event, "🔒 این قابلیت در دسترس نیست.")
+        return
     client = user_clients.get(int(user_id))
     if not client or not client.is_connected():
         client = await ensure_user_client(user_id)
@@ -1615,7 +2002,7 @@ async def _handle_save_command(event, user_id, raw_arg):
             _, result = await _process_save_link(client, links[0])
             await safe_edit(event, result); return
         await safe_edit(event, f"⏳ در حال دانلود {len(links)} لینک...")
-        results = await asyncio.gather(*[_process_save_link(client, l) for l in links])
+        results = await _process_save_links(client, links)
         lines = [f"{i}️⃣ {r}" for i, (_, r) in enumerate(results, 1)]
         await safe_edit(event, "\n\n".join(lines)); return
     reply = await event.get_reply_message()
@@ -1644,7 +2031,7 @@ async def _handle_save_command(event, user_id, raw_arg):
         _, result = await _process_save_link(client, links[0])
         await safe_edit(event, result); return
     await safe_edit(event, f"⏳ در حال دانلود {len(links)} لینک...")
-    results = await asyncio.gather(*[_process_save_link(client, l) for l in links])
+    results = await _process_save_links(client, links)
     lines = [f"{i}️⃣ {r}" for i, (_, r) in enumerate(results, 1)]
     await safe_edit(event, "\n\n".join(lines))
 
@@ -1938,7 +2325,7 @@ def is_equipment_item(name):
         if w in n: return True
     for w in ["کلاه","تیغ","سنگین","سبک","فولادی","آهنی","برنزی",
               "طلایی","نقره‌ای","الماس","فلش"]:
-        if re.search(rf'(?<![\u0600-\u06FF])' + re.escape(w) + rf'(?![\u0600-\u06FF])', n):
+        if re.search(r'(?<![\u0600-\u06FF])' + re.escape(w) + r'(?![\u0600-\u06FF])', n):
             return True
     return False
 
@@ -2277,75 +2664,8 @@ async def _handle_hunt_failure(user_id, chat_id, test_cmd="🦖 شکار هیو�
         log_error(f"_handle_hunt_failure {user_id}: {_translate_bot_errors(e)}")
 
 # ═══════════════════════════════════════════════════════
-# Pew Boss + Heal
+# Pew Heal
 # ═══════════════════════════════════════════════════════
-def parse_pew_boss_pct(text):
-    if not text: return None
-    t = _normalize_persian(normalize_digits(text))
-    m = re.search(r'[\(\[][^\d]*(\d+)\s*%', t)
-    if m:
-        try: return int(m.group(1))
-        except: pass
-    m = re.search(r'HP[^\d]*(\d+)\s*%', t, re.IGNORECASE)
-    if m:
-        try: return int(m.group(1))
-        except: pass
-    m = re.search(r'(\d+)\s*%', t)
-    if m:
-        try: return int(m.group(1))
-        except: pass
-    return None
-
-def is_pew_boss_msg(text):
-    if not text: return False
-    t = _normalize_persian(text)
-    if "HP" in text and "%" in text: return True
-    if "باس" in t: return True
-    if "برای شلیک روی این پیام" in t: return True
-    return False
-
-def is_pew_boss_kill(text):
-    if not text: return False
-    t = _normalize_persian(text)
-    if "کشته شد" in t and ("MVP" in text or "ضربه آخر" in t or "نبرد" in t):
-        return True
-    return False
-
-async def _pew_boss_on_message(uid, chat_id, msg, text):
-    cfg = pew_boss_config.get(int(uid), {})
-    if not cfg.get("enabled"): return
-    if not is_pew_boss_msg(text): return
-    pct = parse_pew_boss_pct(text)
-    if pct is None: return
-    if pct != PEW_BOSS_TARGET_PCT: return
-    key = (int(uid), int(chat_id), int(msg.id))
-    last = pew_boss_shot.get(key, 0)
-    if time.time() - last < 30: return
-    pew_boss_shot[key] = time.time()
-    if len(pew_boss_shot) > 500:
-        now = time.time()
-        for k in [k for k, v in pew_boss_shot.items() if now - v > 3600]:
-            pew_boss_shot.pop(k, None)
-    client = user_clients.get(int(uid))
-    if not client or not client.is_connected():
-        client = await ensure_user_client(uid)
-        if not client: return
-    try:
-        await client.send_message(chat_id, PEW_BOSS_SHOOT_CMD, reply_to=msg.id)
-        log_error(f"🎯 boss shoot at {pct}% → {chat_id} msg={msg.id}")
-    except Exception as e:
-        log_error(f"_pew_boss_on_message {uid}: {_translate_bot_errors(e)}")
-
-async def _pew_boss_on_kill(uid, chat_id, text):
-    st = pew_boss_stats.setdefault(int(uid), {"kills": 0, "last_kill_ts": 0})
-    st["kills"] += 1
-    st["last_kill_ts"] = time.time()
-    log_error(f"🏆 boss killed by {uid}: total={st['kills']}")
-    schedule_save_runtime()
-    try:
-        await _notify_user(uid, f"🏆 باس کشته شد!\n📊 کل کشته‌ها: {st['kills']}")
-    except: pass
-
 def parse_pew_hp(text):
     if not text: return None
     t = _normalize_persian(text)
@@ -2478,11 +2798,32 @@ async def _resolve_pew_group(client, event):
 # ═══════════════════════════════════════════════════════
 # Client mgmt
 # ═══════════════════════════════════════════════════════
+def _start_user_profile_tasks(user_id):
+    uid = int(user_id)
+    if not is_user_active(uid) or not is_user_allowed(uid):
+        return
+    try:
+        user_cfg = users_db.get("users", {}).get(str(uid), {})
+        if user_cfg.get("name_emoji", {}).get("enabled"):
+            start_name_emoji_task(uid)
+        if user_cfg.get("random_profile", {}).get("enabled"):
+            start_random_profile_task(uid)
+    except Exception as e:
+        log_error(f"restart profile tasks {uid}: {_translate_bot_errors(e)}")
+    try:
+        if monitor_db.get(str(uid), {}).get("enabled"):
+            start_monitor_task(uid)
+    except Exception as e:
+        log_error(f"restart profile monitor {uid}: {_translate_bot_errors(e)}")
+
+
 async def ensure_user_client(user_id):
     client = user_clients.get(int(user_id))
     if client and client.is_connected():
         try:
-            if await client.is_user_authorized(): return client
+            if await client.is_user_authorized():
+                _start_user_profile_tasks(user_id)
+                return client
         except: pass
     session_path = SESSION_DIR / str(user_id)
     if not os.path.exists(str(session_path) + ".session"): return None
@@ -2500,12 +2841,13 @@ async def ensure_user_client(user_id):
             await update_user_name_from_account(user_id, new_client)
             await update_user_phone_from_account(user_id, new_client)
             clear_relogin_flag(user_id)
+            _start_user_profile_tasks(user_id)
             return new_client
         await new_client.disconnect()
-        asyncio.create_task(notify_disconnect(user_id)); return None
+        _spawn(notify_disconnect(user_id)); return None
     except Exception as e:
         log_error(f"ensure_user_client {user_id}: {_translate_bot_errors(e)}")
-        asyncio.create_task(notify_disconnect(user_id)); return None
+        _spawn(notify_disconnect(user_id)); return None
 
 async def disconnect_user_client(user_id):
     if user_id in user_clients:
@@ -2522,6 +2864,7 @@ async def create_user_client(user_id):
                 await update_user_name_from_account(user_id, client)
                 await update_user_phone_from_account(user_id, client)
                 clear_relogin_flag(user_id)
+                _start_user_profile_tasks(user_id)
                 return client
         except: pass
         try: await client.disconnect()
@@ -2538,12 +2881,13 @@ async def create_user_client(user_id):
             await update_user_name_from_account(user_id, client)
             await update_user_phone_from_account(user_id, client)
             clear_relogin_flag(user_id)
+            _start_user_profile_tasks(user_id)
             return client
         await client.disconnect()
-        asyncio.create_task(notify_disconnect(user_id)); return None
+        _spawn(notify_disconnect(user_id)); return None
     except Exception as e:
         log_error(f"create_user_client {user_id}: {_translate_bot_errors(e)}")
-        asyncio.create_task(notify_disconnect(user_id)); return None
+        _spawn(notify_disconnect(user_id)); return None
 
 # ═══════════════════════════════════════════════════════
 # پونی
@@ -2747,47 +3091,157 @@ async def handle_pony_response(event, user_id):
                         st["max_notified"] = False; pony_state[st_key] = st
     except Exception as e: log_error(f"handle_pony {user_id}: {_translate_bot_errors(e)}")
 
-async def pony_loop(user_id, chat_id):
-    key = (int(user_id), int(chat_id))
+async def naz_auto_loop(user_id, chat_id):
+    """Send the configured short message to this user's selected group periodically."""
+    uid, cid = int(user_id), int(chat_id)
+    key = (uid, cid)
+    this_task = asyncio.current_task()
     try:
         while True:
             cfg = pony_config.get(key, {})
-            if not cfg.get("collect"): break
-            if not is_user_active(user_id) or not is_user_allowed(user_id): break
+            if not cfg.get("naz_enabled"):
+                break
+            if not is_user_active(uid) or not is_user_allowed(uid):
+                break
+            client = user_clients.get(uid)
+            if not client or not client.is_connected():
+                client = await ensure_user_client(uid)
+            if client and client.is_connected() and pony_config.get(key, {}).get("naz_enabled"):
+                try:
+                    async with get_user_lock(uid):
+                        if pony_config.get(key, {}).get("naz_enabled"):
+                            await client.send_message(cid, "ناز")
+                    log_error(f"💞 auto-naz sent to group {cid} for {uid}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log_error(f"auto-naz {uid}/{cid}: {_translate_bot_errors(e)}")
+            sent_at = time.monotonic()
+            # Read the interval during the wait so changing 3/5 minutes applies
+            # to the current cycle. The extra 10 seconds are part of the interval.
+            while pony_config.get(key, {}).get("naz_enabled"):
+                current = pony_config.get(key, {})
+                minutes = int(current.get("naz_interval_mins", 3) or 3)
+                interval = (minutes * 60) + 10
+                remaining = interval - (time.monotonic() - sent_at)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(5, remaining))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log_error(f"naz_auto_loop {uid}/{cid}: {_translate_bot_errors(e)}")
+    finally:
+        if naz_auto_tasks.get(key) is this_task:
+            naz_auto_tasks.pop(key, None)
+
+
+def start_naz_auto_task(user_id, chat_id):
+    key = (int(user_id), int(chat_id))
+    task = naz_auto_tasks.get(key)
+    if task and not task.done():
+        return False
+    naz_auto_tasks[key] = asyncio.create_task(naz_auto_loop(*key))
+    return True
+
+
+def stop_naz_auto_task(user_id, chat_id):
+    key = (int(user_id), int(chat_id))
+    task = naz_auto_tasks.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def pony_loop(user_id, chat_id):
+    """Run pony collection on the user's configured interval without overlapping attempts."""
+    key = (int(user_id), int(chat_id))
+    this_task = asyncio.current_task()
+    try:
+        while True:
+            cfg = pony_config.get(key, {})
+            if not cfg.get("collect"):
+                break
+            if not is_user_active(user_id) or not is_user_allowed(user_id):
+                break
+
             st = pony_state.setdefault(key, {
-                "phase": "learning", "samples": [],
-                "learned": None, "start_ts": time.time(), "last_fill": 0,
-                "max_notified": False})
-            if "max_notified" not in st: st["max_notified"] = False
-            phase = st.get("phase", "learning")
-            samples_before = st.get("samples", [])
-            last_ts = samples_before[-1][0] if samples_before else 0
+                "phase": "auto", "samples": [], "learned": None,
+                "start_ts": time.time(), "last_fill": 0, "max_notified": False})
+            # Manual intervals replace the old learning cadence, while retaining
+            # all state used by response handling (upgrade/max-level notifications).
+            if st.get("phase") != "auto":
+                st["phase"] = "auto"
+                pony_state[key] = st
+
+            # The bot's retry workflow is per-user, so wait for any in-flight
+            # attempt before issuing another command (even if another chat started it).
+            waited_for_pending = 0
+            while pony_waiting.get(int(user_id)):
+                if not pony_config.get(key, {}).get("collect"):
+                    return
+                pending = pony_waiting.get(int(user_id))
+                retry_task = pending.get("retry_task") if pending else None
+                if waited_for_pending >= 75:
+                    if retry_task and not retry_task.done():
+                        retry_task.cancel()
+                    if pony_waiting.get(int(user_id)) is pending:
+                        pony_waiting.pop(int(user_id), None)
+                    log_error(f"pony pending attempt timed out for {user_id}/{chat_id}")
+                    break
+                await asyncio.sleep(1)
+                waited_for_pending += 1
+
+            cfg = pony_config.get(key, {})
+            if not cfg.get("collect"):
+                break
+            cycle_started = time.monotonic()
+            sent = False
             async with get_user_lock(user_id):
-                await run_pony_workflow(user_id, chat_id)
-            sample = await _wait_for_pony_sample(user_id, chat_id, timeout=60, since_ts=last_ts)
-            if sample: st["last_fill"] = sample[1]
-            if phase == "learning":
-                if sample and sample[1] >= 100:
-                    elapsed = int(time.time() - st.get("start_ts", time.time()))
-                    learned = max(300, min(3600, elapsed))
-                    st["learned"] = learned; st["phase"] = "auto"; st["samples"] = []
-                    schedule_save_runtime()
-                    try:
-                        await _notify_user(user_id,
-                            f"🐴 زمان پر شدن پونی: {learned//60} دقیقه و {learned%60} ثانیه\n"
-                            f"✅ از این به بعد خودکار می‌فرستم.")
-                    except: pass
-                    sleep_time = 5
-                else: sleep_time = 60
-            else:
-                sleep_time = (st.get("learned") or 900) + 30
+                # Recheck after taking the lock to avoid simultaneous sends from
+                # two pony tasks belonging to the same user.
+                if not pony_waiting.get(int(user_id)):
+                    await run_pony_workflow(user_id, chat_id)
+                    sent = True
+            if not sent:
+                await asyncio.sleep(1)
+                continue
+
+            # Wait for the response/retry workflow to finish before the next cycle.
             waited = 0
-            while waited < sleep_time:
-                await asyncio.sleep(min(5, sleep_time - waited)); waited += 5
-                if not pony_config.get(key, {}).get("collect"): return
-    except asyncio.CancelledError: pass
-    except Exception as e: log_error(f"pony_loop {user_id}: {_translate_bot_errors(e)}")
-    finally: pony_tasks.pop(key, None)
+            while pony_waiting.get(int(user_id)):
+                if not pony_config.get(key, {}).get("collect"):
+                    return
+                if waited >= 75:
+                    pending = pony_waiting.get(int(user_id))
+                    retry_task = pending.get("retry_task") if pending else None
+                    if retry_task and not retry_task.done():
+                        retry_task.cancel()
+                    if pony_waiting.get(int(user_id)) is pending:
+                        pony_waiting.pop(int(user_id), None)
+                    log_error(f"pony response timed out for {user_id}/{chat_id}")
+                    break
+                await asyncio.sleep(1)
+                waited += 1
+
+            # Interval is measured between command starts. It is read repeatedly,
+            # so changing it in the panel takes effect without restarting the task.
+            while pony_config.get(key, {}).get("collect"):
+                current = pony_config.get(key, {})
+                interval = max(1, int(current.get("interval_mins", 15))) * 60
+                remaining = interval - (time.monotonic() - cycle_started)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(5, remaining))
+            if not pony_config.get(key, {}).get("collect"):
+                return
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log_error(f"pony_loop {user_id}: {_translate_bot_errors(e)}")
+    finally:
+        # A cancelled old loop must not remove a newer task registered under the same key.
+        if pony_tasks.get(key) is this_task:
+            pony_tasks.pop(key, None)
 
 def start_pony_task(user_id, chat_id):
     key = (int(user_id), int(chat_id))
@@ -2879,10 +3333,10 @@ async def handle_dungeon_response(event, user_id):
         text = event.raw_text or ""
         if is_dungeon_win(text):
             dungeon_waiting.pop(user_id, None)
-            asyncio.create_task(_on_dungeon_win(user_id, state)); return True
+            _spawn(_on_dungeon_win(user_id, state)); return True
         if is_dungeon_loss(text):
             dungeon_waiting.pop(user_id, None)
-            asyncio.create_task(_on_dungeon_loss(user_id, state)); return True
+            _spawn(_on_dungeon_loss(user_id, state)); return True
         if stage == "menu":
             if is_dungeon_menu_message(msg):
                 idx = state.get("monster_idx", 0)
@@ -3043,11 +3497,25 @@ def is_pew_art_enabled(user_id):
 
 def is_pew_art_prompt(text):
     if not text: return False
-    t = _normalize_persian(text)
-    if "فن آرت جدید افتاد" in t or "فن‌آرت جدید افتاد" in t: return True
-    if "فن آرت جدید" in t and "کالکشنت" in t: return True
+    t = _normalize_persian(text).replace("ي", "ی").replace("ك", "ک")
+    # The character name may vary; match the invariant announcement and its arrival verb.
+    has_new_fanart = "فن آرت جدید" in t
+    has_arrival_verb = re.search(
+        r"(?:^|\s)(?:افتاد(?:ه)?|اومد(?:ه)?|آمد(?:ه)?|رسید(?:ه)?)(?:$|\s|[!؟?.,،؛:])", t)
+    if has_new_fanart and has_arrival_verb:
+        return True
+    # Some bot variants announce the same claim with these extra phrases instead.
+    if has_new_fanart and "کالکشنت" in t: return True
     if "اولین نفری" in t and "/art" in t: return True
     return False
+
+def is_pew_art_group_prompt(user_id, event, text):
+    return bool(
+        is_pew_art_enabled(user_id)
+        and getattr(event, "is_group", False)
+        and not getattr(event, "out", False)
+        and is_pew_art_prompt(text)
+    )
 
 def is_pew_art_win(text):
     if not text: return False
@@ -3290,7 +3758,7 @@ async def pew_ring_loop(user_id, chat_id):
             log_error(f"🔍 energy={energy} ups={upgrades}")
 
             if energy is None or not upgrades:
-                log_error(f"⚠️ parse fail")
+                log_error("⚠️ parse fail")
                 waited = 0
                 while waited < 3600:
                     await asyncio.sleep(min(30, 3600-waited)); waited += 30
@@ -3320,7 +3788,7 @@ async def pew_ring_loop(user_id, chat_id):
                 log_error(f"upgrade fail: {_translate_bot_errors(e)}")
 
             # ۶) فوری برگرد بالا، دوباره پیو رینگ
-            log_error(f"🔁 loop again")
+            log_error("🔁 loop again")
     except asyncio.CancelledError: pass
     except Exception as e:
         log_error(f"pew_ring_loop {user_id}: {_translate_bot_errors(e)}")
@@ -3712,7 +4180,7 @@ async def run_pew_dog_workflow(uid, chat_id):
     elif is_pew_dog_feed_success(txt):
         state["next_feed_min"] = 25
         state["last_status"] = "fed"
-        log_error(f"🐕 dog fed ✓ → next 25min")
+        log_error("🐕 dog fed ✓ → next 25min")
     else:
         state["next_feed_min"] = 30
         state["last_status"] = "unknown"
@@ -3778,7 +4246,118 @@ def set_pew_master(uid, key, on):
     # ═══════════════════════════════════════════════════════
 # فروش
 # ═══════════════════════════════════════════════════════
-async def _notify_sell(user_id, msg): await _notify_user(user_id, msg)
+def _notification_is_on(user_id, key):
+    notifs = users_db["users"].get(str(user_id), {}).get("notifications", {})
+    return bool(notifs.get(key, True))
+
+
+async def _notify_feature(user_id, key, msg):
+    if _notification_is_on(user_id, key):
+        await _notify_user(user_id, msg)
+
+
+async def _notify_sell(user_id, msg):
+    await _notify_feature(user_id, "sell", msg)
+
+
+def _transfer_item_key(name):
+    text = normalize_digits(_normalize_persian(str(name or "")))
+    text = text.replace("ي", "ی").replace("ك", "ک")
+    return re.sub(r"[\s\u200c\u200e\u200f]+", "", text).lower()
+
+
+def _inventory_quantity_map(items):
+    quantities = {}
+    for item in items or []:
+        key = _transfer_item_key(item.get("name", ""))
+        if key:
+            quantities[key] = quantities.get(key, 0) + max(0, int(item.get("qty", 0) or 0))
+    return quantities
+
+
+def _planned_transfer_amounts(user_id, category, inventory_items):
+    cfg = (transfer_materials_config if category == "mat_trans" else transfer_items_config).get(user_id, {})
+    if not cfg.get("enabled"):
+        return {}, {}
+    stock = _inventory_quantity_map(inventory_items)
+    grouped = {}
+    labels = {}
+    for rule in cfg.get("rules", []):
+        if not rule.get("enabled", True):
+            continue
+        name = str(rule.get("material", "")).strip()
+        key = _transfer_item_key(name)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(rule)
+        labels.setdefault(key, name)
+    planned = {}
+    turn_state = cfg.get("turn_state", {})
+    for key, rules in grouped.items():
+        available = stock.get(key, 0)
+        if available <= 0:
+            continue
+        start = int(turn_state.get(key, 0) or 0) % len(rules)
+        ordered = rules[start:] + rules[:start]
+        requested_total = 0
+        for index, rule in enumerate(ordered):
+            if available <= 0:
+                break
+            try: requested = int(rule.get("quantity", 0) or 0)
+            except (TypeError, ValueError): requested = 0
+            remaining_rules = len(ordered) - index
+            amount = max(1, available // remaining_rules) if requested == 0 else min(requested, available)
+            amount = max(0, amount)
+            requested_total += amount
+            available -= amount
+        if requested_total:
+            planned[key] = requested_total
+    return planned, labels
+
+
+async def _refresh_sell_inventory(user_id):
+    await _drain_sell_queue(user_id, "sell")
+    await asyncio.sleep(0.3)
+    return await _sell_send_and_wait(user_id, "🎒 موجودی من", 30,
+                                     is_inventory_message, "sell")
+
+
+async def _pre_sale_transfer_category(user_id, category, inventory_items):
+    """Run one configured transfer class and return fresh stock plus failed names."""
+    planned, labels = _planned_transfer_amounts(user_id, category, inventory_items)
+    if not planned:
+        return inventory_items, set()
+    executor = execute_material_transfers if category == "mat_trans" else execute_item_transfers
+    try:
+        await executor(user_id)
+    except Exception as e:
+        log_error(f"pre-sale {category} {user_id}: {_translate_bot_errors(e)}")
+    refreshed = await _refresh_sell_inventory(user_id)
+    failed = set()
+    before = _inventory_quantity_map(inventory_items)
+    if refreshed:
+        after_items = parse_inventory_items(refreshed if isinstance(refreshed, str)
+                                            else (refreshed.raw_text or ""))
+        after = _inventory_quantity_map(after_items)
+        for key, requested in planned.items():
+            moved = max(0, before.get(key, 0) - after.get(key, 0))
+            if moved < requested:
+                failed.add(key)
+                label = labels.get(key, key)
+                await _notify_feature(
+                    user_id, category,
+                    f"⚠️ انتقال {label} کامل نشد ({moved}/{requested}).\n"
+                    "برای جلوگیری از فروش اشتباهی، باقی‌ماندهٔ این مورد در این چرخه فروخته نمی‌شود.")
+        return after_items, failed
+    for key, requested in planned.items():
+        failed.add(key)
+        label = labels.get(key, key)
+        await _notify_feature(
+            user_id, category,
+            f"⚠️ نتیجهٔ انتقال {label} قابل بررسی نبود (موجودی تازه دریافت نشد).\n"
+            "برای ایمنی، این مورد در این چرخه فروخته نمی‌شود.")
+    return inventory_items, failed
+
 
 async def run_sell_workflow(user_id):
     if user_id not in sell_mode_users or not sell_mode_users[user_id].get("enabled"): return
@@ -3800,8 +4379,31 @@ async def run_sell_workflow(user_id):
     inv_text = inv_resp if isinstance(inv_resp, str) else (inv_resp.raw_text or "")
     inv_items = parse_inventory_items(inv_text)
     no_sell = get_no_sell_list(user_id)
-    
-    items_to_sell = [it for it in inv_items if not item_matches_no_sell(it["name"], no_sell)]
+
+    # Transfer configured inventory before entering the shop. Verify each class
+    # from the fresh inventory; if a requested transfer did not happen, protect
+    # that item from sale for this cycle and tell the user in private.
+    transfer_failed_names = set()
+    for transfer_key in ("mat_trans", "item_trans"):
+        cfg = (transfer_materials_config if transfer_key == "mat_trans"
+               else transfer_items_config).get(user_id, {})
+        if cfg.get("enabled") and any(r.get("enabled", True) for r in cfg.get("rules", [])):
+            inv_items, failed_names = await _pre_sale_transfer_category(
+                user_id, transfer_key, inv_items)
+            transfer_failed_names.update(failed_names)
+
+    protected_transfer_names = [
+        str(rule.get("material", "")).strip()
+        for cfg in (transfer_materials_config.get(user_id, {}),
+                    transfer_items_config.get(user_id, {}))
+        if cfg.get("enabled")
+        for rule in cfg.get("rules", [])
+        if rule.get("enabled", True)
+        and _transfer_item_key(rule.get("material", "")) in transfer_failed_names
+    ]
+    sale_exclusions = list(no_sell) + protected_transfer_names
+    items_to_sell = [it for it in inv_items
+                     if not item_matches_no_sell(it["name"], sale_exclusions)]
     if not items_to_sell:
         log_error(f"sell: nothing to sell for {user_id}")
         await _notify_sell(user_id, "ℹ️ آیتمی برای فروش نبود.")
@@ -3847,7 +4449,7 @@ async def run_sell_workflow(user_id):
             qty = item["qty"]
             cmd = item["cmd"]
             
-            if item_matches_no_sell(name, no_sell):
+            if item_matches_no_sell(name, sale_exclusions):
                 continue
             
             full_cmd = f"{cmd}_{qty}" if qty > 1 else cmd
@@ -3946,7 +4548,7 @@ async def run_escape_workflow(user_id, reason="🕵️ قاتل ناشناس ج�
     result_resp = await _sell_send_and_wait(user_id, str(target), 45,
         lambda t: is_teleport_success(t) or is_teleport_fail_no_money(t), "escape")
     if not result_resp:
-        await _notify_escape(user_id, f"⚠️ فرار\nجواب تلپورت نیامد."); return
+        await _notify_escape(user_id, "⚠️ فرار\nجواب تلپورت نیامد."); return
     if is_teleport_fail_no_money(result_resp):
         await _notify_escape(user_id, f"⚠️ فرار\n{reason}.\n❌ پول نیست."); return
     if is_teleport_success(result_resp):
@@ -5060,7 +5662,7 @@ async def send_start_battle(user_id, chat_id, code, delay=240):
                     await bot_client.send_message(chat_id,
                         f"⚠️ تغییر طبقه\n👥 یار ({nm}) تا طبقه {min_floor}\n🏰 فرمانده {target_floor}\n✅ همه می‌ریم {min_floor}")
                 except: pass
-                asyncio.create_task(relocate_and_rejoin(user_id, chat_id, "", min_floor, is_commander=True))
+                _spawn(relocate_and_rejoin(user_id, chat_id, "", min_floor, is_commander=True))
                 return
         missing = []
         if my_allies:
@@ -5096,7 +5698,7 @@ async def send_start_battle(user_id, chat_id, code, delay=240):
                 cinfo["state"] = "idle"; cinfo["start_attempts"] = 0
                 c["commanders"][str(user_id)] = cinfo
                 save_battle()
-                asyncio.create_task(scatter_all_allies_of_commander(chat_id, user_id, False))
+                _spawn(scatter_all_allies_of_commander(chat_id, user_id, False))
                 return
         cinfo["start_attempts"] = 0
         c["commanders"][str(user_id)] = cinfo
@@ -5240,7 +5842,7 @@ async def return_all_members_to_city(chat_id, team_name, reason=""):
         members = pending.get("members", []) if pending else get_team_members(chat_id, team_name)
         if not members: return
         for mid in members:
-            asyncio.create_task(return_member_to_city(mid, chat_id))
+            _spawn(return_member_to_city(mid, chat_id))
             await asyncio.sleep(3)
     except Exception as e: log_error(f"return_all: {_translate_bot_errors(e)}")
 
@@ -5269,7 +5871,7 @@ async def check_and_finalize_team_attack(chat_id, team_name, initiator):
         elapsed = time.time() - pending["created_at"]
         if elapsed > TEAM_ATTACK_JOIN_TIMEOUT:
             pending["cancelled"] = True
-            asyncio.create_task(return_all_members_to_city(chat_id, team_name, f"{len(members)} نفر"))
+            _spawn(return_all_members_to_city(chat_id, team_name, f"{len(members)} نفر"))
             try:
                 missing = [mid for mid in members if js.get(str(mid)) != "confirmed"]
                 names = []
@@ -5451,10 +6053,10 @@ async def scatter_all_allies_of_commander(chat_id, commander_id, is_win=True):
             await bot_client.send_message(chat_id,
                 f"{'🏆' if is_win else '💀'} نتیجه نبرد\n👥 {len(all_members)} نفر در حال پراکنده شدن...")
         except: pass
-        asyncio.create_task(scatter_ally_after_battle(int(commander_id), chat_id, is_win))
+        _spawn(scatter_ally_after_battle(int(commander_id), chat_id, is_win))
         await asyncio.sleep(2)
         for aid in allies:
-            asyncio.create_task(scatter_ally_after_battle(int(aid), chat_id, is_win))
+            _spawn(scatter_ally_after_battle(int(aid), chat_id, is_win))
             await asyncio.sleep(2)
     except Exception as e: log_error(f"scatter_all: {_translate_bot_errors(e)}")
 
@@ -5462,7 +6064,7 @@ async def team_attack_escape_all(chat_id, members, is_win):
     try:
         if not members: return
         for mid in members:
-            asyncio.create_task(scatter_ally_after_battle(mid, chat_id, is_win))
+            _spawn(scatter_ally_after_battle(mid, chat_id, is_win))
             await asyncio.sleep(2)
     except Exception as e: log_error(f"team_attack_escape_all: {_translate_bot_errors(e)}")
 
@@ -5510,30 +6112,31 @@ async def login_cmd(event):
         except: pass
     login_states[user_id] = {"step": "awaiting_phone", "phone": "", "code": "",
         "password": "", "client": None, "message_id": None, "chat_id": event.chat_id}
-    kb = [[
-        types.KeyboardButtonRequestPhone("📱 اشتراک شماره من"),
-        types.KeyboardButton("❌ لغو"),
-    ]]
+    kb = types.ReplyKeyboardMarkup(
+        rows=[
+            types.KeyboardButtonRow(buttons=[
+                types.KeyboardButtonRequestPhone("📱 ارسال شماره من")]),
+            types.KeyboardButtonRow(buttons=[types.KeyboardButton("❌ لغو")]),
+        ], resize=True, single_use=False)
     msg = await event.reply(
-        "📱 شماره‌ت رو بفرست:\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "• روی دکمه زیر بزن → خودکار شماره‌ت ارسال می‌شه\n"
-        "• یا دستی با کد کشور بنویس (بدون + و صفر)\n"
-        "📌 نمونه: 989123456789",
-        buttons=kb)
+        "📱 <b>ورود به حساب</b>\n"
+        "شماره را دستی وارد کن یا دکمهٔ پایین را بزن تا شماره‌ات ارسال شود.\n"
+        "• ایران: بدون صفر و پیش‌شماره (نمونه: 989123456789)\n"
+        "• لغو ورود: دکمهٔ «❌ لغو» را بزن یا «لغو» بفرست.",
+        buttons=kb, parse_mode="html")
     login_states[user_id]["message_id"] = msg.id
     login_states[user_id]["phone_msg_id"] = msg.id
 
 async def handle_login_input(event):
     user_id = event.sender_id
     if user_id not in login_states: return
-    if event.raw_text and event.raw_text.startswith("/"): return
+    if event.raw_text and event.raw_text.startswith("/") and event.raw_text.strip().lower() != "/cancel": return
     state = login_states[user_id]
     step = state.get("step")
     text = normalize_digits((event.raw_text or "").strip())
     if step == "awaiting_phone":
         raw_text = (event.raw_text or "").strip()
-        if raw_text == "❌ لغو":
+        if raw_text in ("❌ لغو", "لغو", "کنسل", "/cancel"):
             login_states.pop(user_id, None)
             try:
                 await event.reply("🔙 لغو شد.\n/login",
@@ -5668,13 +6271,15 @@ async def login_callback_handler(event):
                 await event.edit(
                     "📱 شماره‌ت رو بفرست:\n"
                     "━━━━━━━━━━━━━━━━━\n"
-                    "• روی دکمه زیر بزن → خودکار ارسال می‌شه\n"
-                    "• یا دستی با کد کشور (بدون + و صفر)\n"
+                    "• با دکمهٔ پایین شماره را بفرست یا دستی وارد کن\n"
+                    "• لغو: دکمهٔ «❌ لغو» یا نوشتن «لغو»\n"
                     "📌 نمونه: 989123456789",
-                    buttons=[[
-                        types.KeyboardButtonRequestPhone("📱 اشتراک شماره من"),
-                        types.KeyboardButton("❌ لغو"),
-                    ]])
+                    buttons=types.ReplyKeyboardMarkup(
+                        rows=[
+                            types.KeyboardButtonRow(buttons=[
+                                types.KeyboardButtonRequestPhone("📱 ارسال شماره من")]),
+                            types.KeyboardButtonRow(buttons=[types.KeyboardButton("❌ لغو")]),
+                        ], resize=True, single_use=False))
             except: pass
             return
         session_path = SESSION_DIR / str(user_id)
@@ -5919,17 +6524,15 @@ async def battle_incoming_handler(event, user_id):
             log_error(f"📥 [{user_id}] {sender_uname} ({sender_id_val}): {text_val[:70]}")
 
         is_pew_sender = (sender_uname and sender_uname == PEW_BOT_USERNAME.lower().lstrip("@"))
+        # Detect the fan-art announcement from any sender, in any group, when enabled.
+        # It is not tied to a bot username because these announcements vary by group.
+        if is_pew_art_group_prompt(user_id, event, text_val):
+            log_error(f"🎨 pew art prompt detected in group {event.chat_id} for {user_id}")
+            await _pew_art_catch(user_id, event)
+            return
         if is_pew_sender and text_val:
-            if is_pew_art_prompt(text_val):
-                log_error(f"🎨 pew art prompt detected for {user_id}")
-                await _pew_art_catch(user_id, event)
-                return
             if is_pew_art_win(text_val) or is_pew_art_loss(text_val):
                 await _pew_art_result(user_id, event)
-                return
-            await _pew_boss_on_message(user_id, event.chat_id, event.message, text_val)
-            if is_pew_boss_kill(text_val):
-                await _pew_boss_on_kill(user_id, event.chat_id, text_val)
                 return
 
         if sender_id_val == GAME_BOT_ID or (sender_uname and sender_uname == GAME_BOT_USERNAME.lower()):
@@ -5939,6 +6542,16 @@ async def battle_incoming_handler(event, user_id):
                     user_current_floor[user_id] = detected_floor
 
                 await _route_game_bot_message(user_id, text_val)
+                normalized_game_text = _normalize_persian(text_val)
+                if ("کریستال شانس" in normalized_game_text
+                        and "این شکار" in normalized_game_text
+                        and "استفاده" in normalized_game_text):
+                    try:
+                        await event.client.send_message(event.chat_id, "✅ بله، استفاده شود")
+                        log_error(f"🔮 lucky crystal accepted for {user_id}")
+                    except Exception as e:
+                        log_error(f"lucky crystal reply {user_id}: {_translate_bot_errors(e)}")
+                    return
                 if is_forbidden_equipment_prompt(text_val):
                     try:
                         await event.client.send_message(event.chat_id, "❌ خیر، بدون معجون")
@@ -5974,7 +6587,7 @@ async def battle_incoming_handler(event, user_id):
                                 f"🩸 شکار ناموفق ({cnt}/{max_f})\n"
                                 f"⏳ یه بار دیگه امتحان می‌کنم...")
                         except: pass
-                        asyncio.create_task(_retry_hunt_once(user_id))
+                        _spawn(_retry_hunt_once(user_id))
                     else:
                         hunt_fail_counter[user_id] = 0
                         if not is_floor_test_enabled(user_id):
@@ -5984,7 +6597,7 @@ async def battle_incoming_handler(event, user_id):
                                     f"🔴 جابه‌جایی طبقه خاموشه — همین‌جا می‌مونم")
                             except: pass
                             return
-                        asyncio.create_task(_handle_hunt_failure(user_id, event.chat_id, "🦖 شکار هیولا"))
+                        _spawn(_handle_hunt_failure(user_id, event.chat_id, "🦖 شکار هیولا"))
                     return
                 yes_reply = get_yes_reply(text_val)
                 if yes_reply:
@@ -5996,7 +6609,7 @@ async def battle_incoming_handler(event, user_id):
             if text_val and not _is_team_result and (is_spy_warning(text_val) or is_defense_win_message(text_val)):
                 trigger_reason = "🕵️ قاتل ناشناس جاسوسیت کرد" if is_spy_warning(text_val) else "🛡️ مهاجمت رو شکست دادی"
                 if is_escape_enabled(user_id):
-                    asyncio.create_task(run_escape_workflow_wrapper(user_id, trigger_reason))
+                    _spawn(run_escape_workflow_wrapper(user_id, trigger_reason))
                 else:
                     try:
                         await bot_client.send_message(int(user_id),
@@ -6004,7 +6617,7 @@ async def battle_incoming_handler(event, user_id):
                     except: pass
             if text_val and not _is_team_result and is_kill_message(text_val):
                 if is_return_enabled(user_id):
-                    asyncio.create_task(run_return_workflow_wrapper(user_id))
+                    _spawn(run_return_workflow_wrapper(user_id))
                 else:
                     try:
                         await bot_client.send_message(int(user_id),
@@ -6017,12 +6630,12 @@ async def battle_incoming_handler(event, user_id):
     chat_pending = team_attack_pending.get(chat_str, {})
     for team_name, pending in list(chat_pending.items()):
         if is_not_same_floor_error(text):
-            asyncio.create_task(return_all_members_to_city(chat_id, team_name, "فرمانده و هدف هم‌طبقه نبودن"))
+            _spawn(return_all_members_to_city(chat_id, team_name, "فرمانده و هدف هم‌طبقه نبودن"))
             try: await bot_client.send_message(chat_id, f"⛔ تیم «{team_name}» لغو شد")
             except: pass
             await asyncio.sleep(2); chat_pending.pop(team_name, None); return
         if is_target_in_safe_zone(text):
-            asyncio.create_task(return_all_members_to_city(chat_id, team_name, "هدف در منطقه امن"))
+            _spawn(return_all_members_to_city(chat_id, team_name, "هدف در منطقه امن"))
             try: await bot_client.send_message(chat_id, f"⛔ تیم «{team_name}» لغو شد")
             except: pass
             await asyncio.sleep(2); chat_pending.pop(team_name, None); return
@@ -6039,7 +6652,7 @@ async def battle_incoming_handler(event, user_id):
                 code = pending.get("join_code", "")
                 js = pending.setdefault("join_status", {})
                 js[str(target)] = "need_floor"
-                asyncio.create_task(relocate_and_rejoin(int(target), chat_id, code, required, is_commander=False))
+                _spawn(relocate_and_rejoin(int(target), chat_id, code, required, is_commander=False))
                 return
         if is_join_need_outside(text):
             rej = None
@@ -6053,11 +6666,11 @@ async def battle_incoming_handler(event, user_id):
                 code = pending.get("join_code", "")
                 js = pending.setdefault("join_status", {})
                 js[str(target)] = "need_outside"
-                asyncio.create_task(relocate_and_rejoin(int(target), chat_id, code, 0, is_commander=False))
+                _spawn(relocate_and_rejoin(int(target), chat_id, code, 0, is_commander=False))
                 return
         if not pending.get("join_code"):
             if time.time() - pending["created_at"] > TEAM_ATTACK_JOIN_TIMEOUT:
-                asyncio.create_task(return_all_members_to_city(chat_id, team_name, "بازی کد نداد"))
+                _spawn(return_all_members_to_city(chat_id, team_name, "بازی کد نداد"))
                 try: await bot_client.send_message(chat_id, f"⛔ تیم «{team_name}» لغو")
                 except: pass
                 await asyncio.sleep(2); chat_pending.pop(team_name, None); return
@@ -6067,9 +6680,9 @@ async def battle_incoming_handler(event, user_id):
                 members = pending.get("members", [])
                 for mid in members:
                     pending.setdefault("join_status", {})[str(mid)] = "waiting"
-                    asyncio.create_task(send_member_join(mid, chat_id, jc))
+                    _spawn(send_member_join(mid, chat_id, jc))
                     await asyncio.sleep(3)
-                asyncio.create_task(check_and_finalize_team_attack(chat_id, team_name, pending["initiator"]))
+                _spawn(check_and_finalize_team_attack(chat_id, team_name, pending["initiator"]))
         if is_join_confirmation(text):
             reply_id = event.reply_to_msg_id; confirmed_id = None
             if reply_id:
@@ -6099,9 +6712,9 @@ async def battle_incoming_handler(event, user_id):
             members = dp.get("members", [])
             for mid in members:
                 if is_ally_paused(chat_id, mid): continue
-                asyncio.create_task(relocate_and_rejoin(int(mid), chat_id, defense_code, dp.get("floor", 0), is_commander=False))
+                _spawn(relocate_and_rejoin(int(mid), chat_id, defense_code, dp.get("floor", 0), is_commander=False))
                 await asyncio.sleep(3)
-            asyncio.create_task(_cleanup_defense_pending(chat_str, my_commander, 180))
+            _spawn(_cleanup_defense_pending(chat_str, my_commander, 180))
         return
     if text and (is_team_attack_win(text) or is_team_attack_loss(text)):
         is_win = is_team_attack_win(text)
@@ -6109,7 +6722,7 @@ async def battle_incoming_handler(event, user_id):
             for team_name, p in list(chat_pending.items()):
                 members = p.get("members", [])
                 chat_pending.pop(team_name, None)
-                asyncio.create_task(team_attack_escape_all(chat_id, members, is_win))
+                _spawn(team_attack_escape_all(chat_id, members, is_win))
             return
     am_commander = is_commander(user_id, chat_id)
     ally_commander_id = get_ally_commander(user_id, chat_id)
@@ -6144,11 +6757,11 @@ async def battle_incoming_handler(event, user_id):
             if am_commander:
                 cinfo = c["commanders"].get(str(user_id), {})
                 code = cinfo.get("last_code", "")
-                if code: asyncio.create_task(relocate_and_rejoin(user_id, chat_id, code, required, is_commander=False))
+                if code: _spawn(relocate_and_rejoin(user_id, chat_id, code, required, is_commander=False))
             elif am_ally and ally_commander_id:
                 cinfo = c["commanders"].get(str(ally_commander_id), {})
                 code = cinfo.get("last_code", "")
-                if code: asyncio.create_task(relocate_and_rejoin(user_id, chat_id, code, required, is_commander=False))
+                if code: _spawn(relocate_and_rejoin(user_id, chat_id, code, required, is_commander=False))
         return
     if is_join_need_outside(text):
         rejected_id = None
@@ -6162,11 +6775,11 @@ async def battle_incoming_handler(event, user_id):
             if am_commander:
                 cinfo = get_chat_battle(chat_id)["commanders"].get(str(user_id), {})
                 code = cinfo.get("last_code", ""); tgt_floor = cinfo.get("floor", 0)
-                if code: asyncio.create_task(relocate_and_rejoin(user_id, chat_id, code, tgt_floor, is_commander=False))
+                if code: _spawn(relocate_and_rejoin(user_id, chat_id, code, tgt_floor, is_commander=False))
             elif am_ally and ally_commander_id:
                 cinfo = get_chat_battle(chat_id)["commanders"].get(str(ally_commander_id), {})
                 code = cinfo.get("last_code", ""); tgt_floor = cinfo.get("floor", 0)
-                if code: asyncio.create_task(relocate_and_rejoin(user_id, chat_id, code, tgt_floor, is_commander=False))
+                if code: _spawn(relocate_and_rejoin(user_id, chat_id, code, tgt_floor, is_commander=False))
         return
     if is_join_confirmation(text):
         join_name = extract_join_name(text)
@@ -6261,8 +6874,8 @@ async def battle_incoming_handler(event, user_id):
             c["ally_cooldowns"] = {}
             c["commander_floor_change_for"] = ""
             save_battle()
-            await _notify_user(user_id, f"✅ فتح شد\n🔄 همه پراکنده می‌شن...")
-            asyncio.create_task(scatter_all_allies_of_commander(chat_id, user_id, True))
+            await _notify_user(user_id, "✅ فتح شد\n🔄 همه پراکنده می‌شن...")
+            _spawn(scatter_all_allies_of_commander(chat_id, user_id, True))
             if auto_on: schedule_auto_farakhans(user_id, chat_id, 15)
             return
     if am_ally and is_alert_message(text):
@@ -6282,7 +6895,7 @@ async def battle_incoming_handler(event, user_id):
                 if not player_name or commander_nick not in player_name: return
             elif not my_commander_recent: return
         code = extract_join_code(text); floor = extract_floor_number(text)
-        if code: asyncio.create_task(ally_prepare_for_battle(user_id, chat_id, code, floor or 0))
+        if code: _spawn(ally_prepare_for_battle(user_id, chat_id, code, floor or 0))
 
 def make_battle_handler(user_id):
     async def battle_handler(event):
@@ -6313,13 +6926,13 @@ async def panel_main(event, user_id):
     lines.append(_p_sep())
     lines.append("")
     lines.append(f"  🎮  <code>{CMD}پنل بازی</code>")
-    lines.append(f"       <i>کاردینال · پونی · پیو</i>")
+    lines.append("       <i>کاردینال · پونی · پیو</i>")
     lines.append("")
     lines.append(f"  📢  <code>{CMD}پنل تبچی</code>")
-    lines.append(f"       <i>پیام خودکار تو گروه‌ها</i>")
+    lines.append("       <i>پیام خودکار تو گروه‌ها</i>")
     lines.append("")
     lines.append(f"  📊  <code>{CMD}وضعیت</code>")
-    lines.append(f"       <i>خلاصه وضعیت همه فیچرها</i>")
+    lines.append("       <i>خلاصه وضعیت همه فیچرها</i>")
     lines.append("")
     lines.append(_p_sep())
     lines.append("  📚 <b>راهنماها:</b>")
@@ -6344,13 +6957,13 @@ async def panel_games(event, user_id):
     lines.append("  👇 یکی رو انتخاب کن:")
     lines.append("")
     lines.append(f"  ⚔️  <code>{CMD}پنل کاردینال</code>")
-    lines.append(f"       <i>فروش · شکار · فرار · جایزه · انتقال · نبرد</i>")
+    lines.append("       <i>فروش · شکار · فرار · جایزه · انتقال · نبرد</i>")
     lines.append("")
     lines.append(f"  🐴  <code>{CMD}پنل پونی</code>")
-    lines.append(f"       <i>پونی · ارتقا · دانجن</i>")
+    lines.append("       <i>پونی · ارتقا · دانجن</i>")
     lines.append("")
     lines.append(f"  🔫  <code>{CMD}پنل پیو</code>")
-    lines.append(f"       <i>رینگ · هدف · سگ · باس ۱٪ · فن‌آرت</i>")
+    lines.append("       <i>رینگ · هدف · سگ · فن‌آرت</i>")
     lines.append("")
     lines.append(_p_foot())
     await safe_edit(event, "\n".join(lines), parse_mode="html")
@@ -6457,7 +7070,7 @@ async def panel_banner(event, user_id):
     lines.append(_p_sep())
     lines.append(f"  ▸ <code>{CMD}تبچی هدف &lt;نام&gt;</code>")
     lines.append(f"  ▸ <code>{CMD}تبچی بازه &lt;نام&gt; &lt;مدت&gt;</code>")
-    lines.append(f"     <i>(s=ثانیه · m=دقیقه · h=ساعت · d=روز)</i>")
+    lines.append("     <i>(s=ثانیه · m=دقیقه · h=ساعت · d=روز)</i>")
     lines.append(f"  ▸ <code>{CMD}تبچی ریپلای &lt;نام&gt;</code> + ریپلای")
     lines.append("")
     lines.append(_p_sep())
@@ -6633,8 +7246,6 @@ async def panel_pew_text(event, user_id):
     tgt_t = sum(1 for k in pew_target_config if k[0] == int(user_id))
     dog_c = sum(1 for k, v in pew_dog_config.items() if k[0] == int(user_id) and v.get("enabled"))
     dog_t = sum(1 for k in pew_dog_config if k[0] == int(user_id))
-    boss_on = pew_boss_config.get(int(user_id), {}).get("enabled", False)
-    boss_k = pew_boss_stats.get(int(user_id), {}).get("kills", 0)
     lines = []
     lines.append("╔══════════════════╗")
     lines.append("║  🔫  پنل پیو پیو  ║")
@@ -6644,7 +7255,6 @@ async def panel_pew_text(event, user_id):
     lines.append(_p_status_line("🏋️ پیو رینگ", ring_c > 0, extra=f"{ring_c}/{ring_t} گروه", hint="از پنل شیشه‌ای"))
     lines.append(_p_status_line("🎯 پیو هدف", tgt_c > 0, extra=f"{tgt_c}/{tgt_t} هدف", hint="از پنل شیشه‌ای"))
     lines.append(_p_status_line("🐕 پیو سگ", dog_c > 0, extra=f"{dog_c}/{dog_t} گروه", hint="از پنل شیشه‌ای"))
-    lines.append(_p_status_line("🗡 باس ۱٪", boss_on, extra=f"🏆 {boss_k} کشته", hint="از پنل شیشه‌ای"))
     lines.append("")
     lines.append(_p_foot())
     lines.append(f"  💡 همه‌ی تنظیمات از پنل شیشه‌ای <code>{CMD}پنل</code>")
@@ -6673,22 +7283,23 @@ async def panel_tools(event, user_id):
     lines.append(f"  ▸ <code>{CMD}فونت روشن</code>  /  <code>{CMD}فونت خاموش</code>")
     lines.append(f"  ▸ <code>{CMD}پنل فونت</code>  →  انتخاب فونت")
     lines.append("")
-    ttl_cfg = get_ttl_config(user_id)
-    ttl_target = "پیام‌های ذخیره شده" if ttl_cfg["target"] == "me" else str(ttl_cfg["target"])
-    lines.append(_p_sep())
-    lines.append("  🔥 <b>TTL (رسانه ناپدیدشونده):</b>")
-    lines.append(_p_status_line("ذخیره خودکار", ttl_cfg["enabled"], hint=f"{CMD}تی تی ال روشن"))
-    lines.append(f"     🎯 مقصد: <code>{ttl_target}</code>")
-    lines.append(f"  ▸ <code>{CMD}تی تی ال</code>  →  مشاهده")
-    lines.append(f"  ▸ <code>{CMD}تی تی ال روشن</code>  /  خاموش")
-    lines.append(f"  ▸ <code>{CMD}تی تی ال هدف</code>  →  تنظیم مقصد")
-    lines.append("")
-    lines.append(_p_sep())
-    lines.append("  📥 <b>ذخیره رسانه:</b>")
-    lines.append(f"  ▸ <code>{CMD}ذخیره &lt;لینک&gt;</code>  →  دانلود از لینک")
-    lines.append(f"  ▸ ریپلای روی پیام + <code>{CMD}ذخیره</code>")
-    lines.append(f"  ▸ ذخیره می‌شه تو: <b>پیام‌های ذخیره شده</b>")
-    lines.append("")
+    if is_media_allowed(user_id):
+        ttl_cfg = get_ttl_config(user_id)
+        ttl_target = "پیام‌های ذخیره شده" if ttl_cfg["target"] == "me" else str(ttl_cfg["target"])
+        lines.append(_p_sep())
+        lines.append("  🔥 <b>TTL (رسانه ناپدیدشونده):</b>")
+        lines.append(_p_status_line("ذخیره خودکار", ttl_cfg["enabled"], hint=f"{CMD}تی تی ال روشن"))
+        lines.append(f"     🎯 مقصد: <code>{ttl_target}</code>")
+        lines.append(f"  ▸ <code>{CMD}تی تی ال</code>  →  مشاهده")
+        lines.append(f"  ▸ <code>{CMD}تی تی ال روشن</code>  /  خاموش")
+        lines.append(f"  ▸ <code>{CMD}تی تی ال هدف</code>  →  تنظیم مقصد")
+        lines.append("")
+        lines.append(_p_sep())
+        lines.append("  📥 <b>ذخیره رسانه:</b>")
+        lines.append(f"  ▸ <code>{CMD}ذخیره &lt;لینک&gt;</code>  →  دانلود از لینک")
+        lines.append(f"  ▸ ریپلای روی پیام + <code>{CMD}ذخیره</code>")
+        lines.append("  ▸ ذخیره می‌شه تو: <b>پیام‌های ذخیره شده</b>")
+        lines.append("")
     lines.append(_p_foot())
     lines.append(f"  💡 از پنل شیشه‌ای هم: <code>{CMD}پنل</code> → ابزارها")
     await safe_edit(event, "\n".join(lines), parse_mode="html")
@@ -6710,14 +7321,16 @@ async def panel_html_text(event, user_id):
     lines.append(f"  ▸ <code>{CMD}استایل خاموش</code>")
     lines.append("")
     lines.append(_p_sep())
-    lines.append("  📋 <b>انتخاب استایل:</b>  <i>(هر استایل با خودش)</i>")
+    lines.append("  📋 <b>انتخاب استایل:</b> هر بار فقط یک استایل فعال است.")
+    lines.append(f"  ▸ برای انتخاب، بنویس: <code>{CMD}استایل &lt;نام استایل&gt;</code>؛ فارسی یا انگلیسی.")
+    lines.append("  ▸ از آن به بعد پیام عادی‌ات ویرایش می‌شود و استایل می‌گیرد.")
     lines.append("")
     for key, s in HTML_STYLES.items():
+        if key in ("none", "pre"): continue  # خاموشی دکمهٔ جدا دارد؛ pre هم نام قدیمی است.
         mark = "✅" if key == cur else "▫️"
-        if key == "none": preview = "Sample"
-        elif s["open"]: preview = f"{s['open']}Sample{s['close']}"
-        else: preview = "Sample"
-        key_preview = _preview_style_text(key, key)
+        sample = "سلام" if key == "kashida" else "Sample"
+        preview = f"{s['open']}{html_lib.escape(sample)}{s['close']}" if s["open"] else _preview_style_text(key, sample)
+        key_preview = _preview_style_text(key, sample)
         aliases = STYLE_ALIASES.get(key, [])
         fa_name = aliases[0] if aliases else ""
         lines.append(f"  {mark} <code>{CMD}استایل {key}</code>")
@@ -6854,8 +7467,7 @@ async def panel_status_private(event, user_id):
     tgt_any = any(c.get("enabled") for k, c in pew_target_config.items() if k[0] == int(user_id))
     dog_any = any(c.get("enabled") for k, c in pew_dog_config.items() if k[0] == int(user_id))
     art_any = is_pew_art_enabled(user_id)
-    boss_any = pew_boss_config.get(int(user_id), {}).get("enabled", False)
-    if p_any or d_any or ring_any or tgt_any or dog_any or art_any or boss_any:
+    if p_any or d_any or ring_any or tgt_any or dog_any or art_any:
         lines.append("  🎮 <b>بازی:</b>")
         lines.append(_p_sep())
         if p_any: lines.append(_p_status_line("🐴 پونی", True))
@@ -6864,7 +7476,6 @@ async def panel_status_private(event, user_id):
         if tgt_any: lines.append(_p_status_line("🎯 پیو هدف", True))
         if dog_any: lines.append(_p_status_line("🐕 پیو سگ", True))
         if art_any: lines.append(_p_status_line("🎨 پیو آرت", True))
-        if boss_any: lines.append(_p_status_line("🗡 باس ۱٪", True))
         lines.append("")
     no_sell = get_no_sell_list(user_id)
     if no_sell:
@@ -7000,7 +7611,10 @@ COMMAND_HINTS = [
     "پنل پیو", "پیو",
     "پنل تبچی", "تبچی",
     "پنل ابزار", "پنل ابزارها",
-    "پنل فونت", "پنل استایل",
+    "پنل فونت", "پنل استایل", "راهنمای استایل", "استایل",
+    "پنل پایش", "پایش", "پایش افزودن", "پایش حذف", "لیست پایش",
+    "پنل ویس", "پنل صدا", "ویس", "گوش کن",
+    "پروفایل رندوم", "پروفایل رندوم روشن", "پروفایل رندوم خاموش",
     "فونت روشن", "فونت خاموش",
     "استایل روشن", "استایل خاموش",
     "تی تی ال", "تی تی ال روشن", "تی تی ال خاموش", "تی تی ال هدف",
@@ -7033,6 +7647,11 @@ def make_user_handler(user_id):
             text = re.sub(r'\s+', ' ', text).strip().replace('ي', 'ی').replace('ك', 'ک')
             if text.startswith(CMD) and len(text) > len(CMD) and text[len(CMD)] == " ":
                 text = CMD + text[len(CMD):].lstrip()
+        if not is_user_allowed(user_id):
+            if text.startswith(CMD):
+                try: await safe_edit(event, "🔒 دسترسی این حساب توسط مالک قفل شده است.")
+                except: pass
+            return
         if user_id in broadcast_waiting:
             if not is_grp_owner(user_id):
                 broadcast_waiting.pop(user_id, None); return
@@ -7050,13 +7669,42 @@ def make_user_handler(user_id):
                     try: await event.reply(f"❌ خطا: {_translate_bot_errors(e)}")
                     except: pass
                 return
-        if user_id in pm_banner_states:
-            st_mode = pm_banner_states[user_id].get("mode", "")
+        own_pending_state = pm_banner_states.get(user_id)
+        routed_state_uid = (user_id if own_pending_state is not None
+                            and own_pending_state.get("panel_actor_id", int(user_id)) == int(user_id)
+                            else None)
+        if routed_state_uid is None:
+            for target_uid, pending_state in list(pm_banner_states.items()):
+                if (pending_state.get("panel_actor_id") == int(user_id)
+                        and pending_state.get("prompt_chat_id") in (None, event.chat_id)):
+                    routed_state_uid = target_uid
+                    break
+        if routed_state_uid is not None:
+            st_mode = pm_banner_states[routed_state_uid].get("mode", "")
             if st_mode.startswith("mat_") or st_mode.startswith("item_"):
-                handled = await _pm_mat_state_input(event, user_id)
+                handled = await _pm_mat_state_input(event, routed_state_uid)
             else:
-                handled = await _pm_banner_state_input(event, user_id)
+                handled = await _pm_banner_state_input(event, routed_state_uid)
+            updated_state = pm_banner_states.get(routed_state_uid)
+            if updated_state is not None and int(routed_state_uid) != int(user_id):
+                updated_state["panel_actor_id"] = int(user_id)
             if handled: return
+        # Apply selected font/HTML style to ordinary outgoing user text. Commands
+        # and workflow replies must remain unchanged so their parsing still works.
+        if (text and getattr(event, "out", False)
+                and not text.startswith((CMD, "/"))
+                and routed_state_uid is None
+                and user_id not in pm_banner_states
+                and user_id not in broadcast_waiting):
+            user_cfg = users_db["users"].get(str(user_id), {})
+            if user_cfg.get("font_on") or user_cfg.get("html_style_on"):
+                styled_text = apply_user_style(user_id, event.raw_text or "")
+                if styled_text != (event.raw_text or ""):
+                    try:
+                        await event.edit(styled_text, parse_mode="html")
+                        return
+                    except Exception as e:
+                        log_error(f"apply user style {user_id}: {_translate_bot_errors(e)}")
         if not event.raw_text or event.raw_text.startswith("/"): return
         try:
             if text.startswith(f"{CMD}افزودن انتقال مواد "):
@@ -7278,7 +7926,7 @@ def make_user_handler(user_id):
                         f"📢 دستور فرمانده\n🎯 همه بیان طبقه {target_floor}\n🚪 و از شهر خارج بشن")
                 except: pass
                 for aid in my_allies:
-                    asyncio.create_task(relocate_and_rejoin(int(aid), event.chat_id, "", target_floor, is_commander=False))
+                    _spawn(relocate_and_rejoin(int(aid), event.chat_id, "", target_floor, is_commander=False))
                     await asyncio.sleep(3)
                 return
             # همه پراکندگی
@@ -7289,13 +7937,13 @@ def make_user_handler(user_id):
                     await safe_edit(event, "📭 یاری نداری."); return
                 await safe_edit(event, f"📢 دستور به {len(my_allies)} یار\n🎲 پراکنده بشن")
                 for aid in my_allies:
-                    asyncio.create_task(scatter_ally_after_battle(int(aid), event.chat_id, True))
+                    _spawn(scatter_ally_after_battle(int(aid), event.chat_id, True))
                     await asyncio.sleep(3)
                 return
             # دفاع تیمی
             if text == f"{CMD}دفاع تیمی" or text.startswith(f"{CMD}دفاع تیمی "):
                 if is_ally(user_id, event.chat_id):
-                    await safe_edit(event, f"❌ فقط فرمانده."); return
+                    await safe_edit(event, "❌ فقط فرمانده."); return
                 if not is_commander(user_id, event.chat_id):
                     await safe_edit(event, f"❌ اول {CMD}فرمانده"); return
                 arg = text.replace(f"{CMD}دفاع تیمی", "", 1).strip()
@@ -7313,9 +7961,9 @@ def make_user_handler(user_id):
                     "created_at": time.time(), "initiator": int(user_id), "started": False}
                 save_battle()
                 await safe_edit(event, f"🛡️ دفاع تیمی\n🎯 طبقه: {target_floor}\n👥 {len(all_members)} عضو")
-                asyncio.create_task(_prepare_defense_commander(user_id, event.chat_id, target_floor))
+                _spawn(_prepare_defense_commander(user_id, event.chat_id, target_floor))
                 for aid in my_allies:
-                    asyncio.create_task(_prepare_defense_ally(aid, event.chat_id, target_floor))
+                    _spawn(_prepare_defense_ally(aid, event.chat_id, target_floor))
                     await asyncio.sleep(3)
                 return
             # فراخوان
@@ -7328,7 +7976,7 @@ def make_user_handler(user_id):
                         await safe_edit(event, f"❌ {CMD}فراخوان <شماره طبقه>"); return
                     forced_floor = int(arg_norm)
                 if is_ally(user_id, event.chat_id):
-                    await safe_edit(event, f"❌ یاری."); return
+                    await safe_edit(event, "❌ یاری."); return
                 if not is_commander(user_id, event.chat_id):
                     add_commander(user_id, event.chat_id)
                 else:
@@ -7343,7 +7991,7 @@ def make_user_handler(user_id):
                     await safe_edit(event, f"🔄 آماده‌سازی فراخوان برای طبقه {forced_floor}...")
                 else:
                     await safe_edit(event, "🔄 آماده‌سازی فراخوان (بالاترین مرز)...")
-                asyncio.create_task(prepare_commander_for_farakhans(user_id, event.chat_id, forced_floor))
+                _spawn(prepare_commander_for_farakhans(user_id, event.chat_id, forced_floor))
                 return
             if text == f"{CMD}لغو نبرد":
                 count = cancel_user_battle_tasks(user_id)
@@ -7355,20 +8003,20 @@ def make_user_handler(user_id):
                     await safe_edit(event, f"❌ {CMD}حمله تیمی ایجاد <اسم>"); return
                 teams = get_team_dict(event.chat_id)
                 if team_name in teams:
-                    await safe_edit(event, f"❌ وجود داره."); return
+                    await safe_edit(event, "❌ وجود داره."); return
                 if get_user_team_in_chat(event.chat_id, user_id):
-                    await safe_edit(event, f"❌ تو تیم دیگه‌ای هستی."); return
+                    await safe_edit(event, "❌ تو تیم دیگه‌ای هستی."); return
                 join_team(event.chat_id, team_name, user_id)
                 await safe_edit(event, f"✅ تیم «{team_name}» ساخته شد.\n👥 1/{MAX_TEAM_ATTACK_MEMBERS}"); return
             if text.startswith(f"{CMD}حمله تیمی روشن "):
                 team_name = text.replace(f"{CMD}حمله تیمی روشن ", "", 1).strip()
                 teams = get_team_dict(event.chat_id)
                 if team_name not in teams:
-                    await safe_edit(event, f"❌ نیست."); return
+                    await safe_edit(event, "❌ نیست."); return
                 if is_in_team(event.chat_id, team_name, user_id):
                     await safe_edit(event, "⚠️ هستی."); return
                 if get_user_team_in_chat(event.chat_id, user_id):
-                    await safe_edit(event, f"❌ تو تیم دیگه‌ای هستی."); return
+                    await safe_edit(event, "❌ تو تیم دیگه‌ای هستی."); return
                 cnt = len(get_team_members(event.chat_id, team_name))
                 if cnt >= MAX_TEAM_ATTACK_MEMBERS:
                     await safe_edit(event, f"❌ پره ({cnt}/{MAX_TEAM_ATTACK_MEMBERS})"); return
@@ -7378,7 +8026,7 @@ def make_user_handler(user_id):
             if text.startswith(f"{CMD}حمله تیمی خاموش "):
                 team_name = text.replace(f"{CMD}حمله تیمی خاموش ", "", 1).strip()
                 if not is_in_team(event.chat_id, team_name, user_id):
-                    await safe_edit(event, f"❌ نیستی."); return
+                    await safe_edit(event, "❌ نیستی."); return
                 leave_team(event.chat_id, team_name, user_id)
                 cnt = len(get_team_members(event.chat_id, team_name))
                 if cnt == 0:
@@ -7394,7 +8042,7 @@ def make_user_handler(user_id):
                 if not target_id_str.isdigit():
                     await safe_edit(event, "❌ C_ID باید بین ۱ تا ۵ رقم باشد."); return
                 if not is_in_team(event.chat_id, team_name, user_id):
-                    await safe_edit(event, f"❌ نیستی."); return
+                    await safe_edit(event, "❌ نیستی."); return
                 members = get_team_members(event.chat_id, team_name)
                 if not members:
                     await safe_edit(event, "❌ خالیه."); return
@@ -7459,9 +8107,18 @@ def make_user_handler(user_id):
                     await client.send_message(targets[0], "🔗 تست ریپلای", reply_to=replied.id)
                     banners[bname]["reply_to_msg_id"] = replied.id
                     save_json(BANNERS_FILE, banners_db)
-                    await safe_edit(event, f"✅ ریپلای تنظیم شد.")
+                    await safe_edit(event, "✅ ریپلای تنظیم شد.")
                 except Exception as e:
                     await safe_edit(event, f"❌ {_translate_bot_errors(e)}")
+                return
+            # 🔒 گیت قفل بخش‌ها: دستور متنی بخش قفل‌شده اجرا نمی‌شود
+            _locked_lbl = _locked_command_label(user_id, text)
+            if _locked_lbl:
+                _lmsg = f"🔒 بخش «{_locked_lbl}» توسط مالک قفل شده است."
+                try: await safe_edit(event, _lmsg)
+                except Exception:
+                    try: await event.respond(_lmsg)
+                    except Exception: pass
                 return
             # پنل‌های متنی
             if text in (f"{CMD}پنل بازی", f"{CMD}بازی"):
@@ -7476,7 +8133,8 @@ def make_user_handler(user_id):
                 await panel_banner(event, user_id); return
             if text in (f"{CMD}پنل ابزار", f"{CMD}ابزارها", f"{CMD}پنل ابزارها"):
                 await panel_tools(event, user_id); return
-            if text in (f"{CMD}پنل استایل", f"{CMD}پنل HTML"):
+            if text in (f"{CMD}پنل استایل", f"{CMD}پنل HTML",
+                        f"{CMD}راهنمای استایل", f"{CMD}استایل"):
                 await panel_html_text(event, user_id); return
             if text in (f"{CMD}پنل فونت",):
                 await panel_font_text(event, user_id); return
@@ -7572,6 +8230,7 @@ def make_user_handler(user_id):
                 if user_id not in sell_mode_users:
                     await safe_edit(event, "⚠️ خاموش."); return
                 stop_sell_mode(user_id)
+                _ensure_enabled_transfer_schedulers(user_id)
                 await safe_edit(event, "🔴 خاموش شد."); return
             if text == f"{CMD}نفروش" or text.startswith(f"{CMD}نفروش "):
                 arg = text.replace(f"{CMD}نفروش", "", 1).strip()
@@ -7618,7 +8277,7 @@ def make_user_handler(user_id):
                 items = parse_no_sell_args(arg)
                 removed = remove_no_sell_items(user_id, items)
                 if removed == 0:
-                    await safe_edit(event, f"❌ توی لیست نبود."); return
+                    await safe_edit(event, "❌ توی لیست نبود."); return
                 await safe_edit(event, f"✅ {removed} حذف شد.\n📊 باقی: {len(get_no_sell_list(user_id))}"); return
             if text == f"{CMD}حذف نفروش":
                 await safe_edit(event, f"❌ {CMD}حذف نفروش <اسم>"); return
@@ -7657,8 +8316,89 @@ def make_user_handler(user_id):
                     await safe_edit(event, "⚠️ خاموش."); return
                 stop_daily_gift(user_id)
                 await safe_edit(event, "🔴 جایزه خاموش شد."); return
+            # پروفایل رندوم: چرخش بین عکس‌های موجود در گالری پروفایل تلگرام.
+            if text == f"{CMD}پروفایل رندوم روشن":
+                ok, result = await set_random_profile_enabled(user_id, True)
+                await safe_edit(event, result); return
+            if text == f"{CMD}پروفایل رندوم خاموش":
+                _ok, result = await set_random_profile_enabled(user_id, False)
+                await safe_edit(event, result); return
+            if text == f"{CMD}پروفایل رندوم":
+                cfg = get_random_profile_config(user_id)
+                photos_count = len(cfg.get("photo_ids", []))
+                try:
+                    _client, photos = await _load_own_profile_photos(user_id)
+                    photos_count = len(photos)
+                    if not cfg.get("enabled"):
+                        cfg["photo_ids"] = [photo_id for photo_id, _ in photos]
+                        save_json(USERS_FILE, users_db)
+                except Exception: pass
+                iv = {60: "۱ دقیقه", 300: "۵ دقیقه", 600: "۱۰ دقیقه"}.get(
+                    int(cfg.get("interval", 60) or 60), "۱ دقیقه")
+                await safe_edit(event,
+                    f"📷 پروفایل رندوم: {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}\n"
+                    f"🖼 عکس‌های قابل‌چرخش: {photos_count}\n⏱ بازه: {iv}\n"
+                    f"روشن: {CMD}پروفایل رندوم روشن\nخاموش: {CMD}پروفایل رندوم خاموش")
+                return
+            # پایش پروفایل، تبدیل متن/ویس و استایل‌ها؛ دستورهای متنی همگی با CMD (ویرگول فارسی) هستند.
+            if text in (f"{CMD}پایش", f"{CMD}پنل پایش"):
+                await safe_edit(event,
+                    "👁 پایش پروفایل\n"
+                    f"افزودن با ریپلای یا آیدی: <code>{CMD}پایش افزودن @username</code>\n"
+                    f"حذف: <code>{CMD}پایش حذف @username</code>\n"
+                    f"فهرست: <code>{CMD}لیست پایش</code>\n"
+                    "برای روشن/خاموش‌کردن پایش کلی از دکمه‌های پنل ابزارها استفاده کن.",
+                    parse_mode="html"); return
+            if text.startswith(f"{CMD}پایش افزودن"):
+                arg = text.replace(f"{CMD}پایش افزودن", "", 1).strip()
+                ok, result = await _monitor_add_target(user_id, event, arg)
+                await safe_edit(event, result); return
+            if text.startswith(f"{CMD}پایش حذف"):
+                arg = text.replace(f"{CMD}پایش حذف", "", 1).strip()
+                client = user_clients.get(int(user_id))
+                if not client or not client.is_connected(): client = await ensure_user_client(user_id)
+                tid = await resolve_user_arg(event, client, arg) if client else None
+                users = monitor_db.get(str(int(user_id)), {}).get("users", {})
+                if tid and str(int(tid)) in users:
+                    users.pop(str(int(tid)), None); _save_monitor_db()
+                    await safe_edit(event, f"✅ {tid} از فهرست پایش حذف شد."); return
+                await safe_edit(event, "❌ فرد در فهرست پایش پیدا نشد."); return
+            if text == f"{CMD}لیست پایش":
+                cfg = monitor_db.get(str(int(user_id)), {})
+                targets = cfg.get("users", {})
+                if not targets:
+                    await safe_edit(event, "📭 فهرست پایش خالی است."); return
+                lines = [f"👁 فهرست پایش ({len(targets)} نفر):"]
+                for tid, info in list(targets.items())[:50]:
+                    icon = "🟢" if info.get("enabled", True) else "🔴"
+                    uname = f" · @{info['last_uname']}" if info.get("last_uname") else ""
+                    lines.append(f"{icon} {info.get('last_name') or tid}{uname} — {tid}")
+                await safe_edit(event, "\n".join(lines)); return
+            if text in (f"{CMD}پنل ویس", f"{CMD}پنل صدا"):
+                await safe_edit(event,
+                    "🔊 تبدیل متن و ویس\n"
+                    f"{CMD}ویس <متن>\n{CMD}ویس زن <متن>\n{CMD}ویس مرد <متن>\n"
+                    f"روی ویس ریپلای کن و بنویس {CMD}گوش کن")
+                return
+            if text == f"{CMD}گوش کن":
+                await _transcribe_voice_reply(event); return
+            if text == f"{CMD}ویس" or text.startswith(f"{CMD}ویس "):
+                body = text[len(f"{CMD}ویس"):].strip()
+                gender = None
+                if body == "زن" or body.startswith("زن "):
+                    gender = "female"; body = body[2:].strip()
+                elif body == "مرد" or body.startswith("مرد "):
+                    gender = "male"; body = body[3:].strip()
+                if not body:
+                    try:
+                        replied = await event.get_reply_message()
+                        body = (replied.raw_text or "").strip() if replied else ""
+                    except: body = ""
+                await _send_tts_voice(event, body, gender); return
+
             # ابزارها
             if text == f"{CMD}استایل روشن":
+
                 if users_db["users"].get(str(user_id), {}).get("html_style_on"):
                     await safe_edit(event, "⚠️ از قبل روشنه."); return
                 set_user_html_style_on(user_id, True)
@@ -7672,16 +8412,22 @@ def make_user_handler(user_id):
                 raw = text.replace(f"{CMD}استایل ", "", 1).strip()
                 key = _find_style_key(raw)
                 if not key:
-                    keys_list = " · ".join(HTML_STYLES.keys())
+                    keys_list = " · ".join(k for k in HTML_STYLES if k != "pre")
                     await safe_edit(event,
                         f"❌ استایل نامعتبر.\n\n"
                         f"💡 انگلیسی: <code>{keys_list}</code>\n"
-                        f"💡 فارسی: بولد · کج · زیرخط · روخط · کد · مخفی · نقل قول")
+                        f"💡 فارسی: پررنگ · کج · پررنگ و کج · زیرخط‌دار · خط‌خورده · اسپویلر · تک‌عرض · بلوک کد · نقل‌قول · کشیده")
                     return
                 set_user_html_style(user_id, key)
-                if key != "none":
+                if key == "none":
+                    set_user_html_style_on(user_id, False)
+                else:
                     set_user_html_style_on(user_id, True)
-                await safe_edit(event, f"✅ استایل → {HTML_STYLES[key]['label']}"); return
+                if key == "none":
+                    await safe_edit(event, "🔴 استایل خاموش شد."); return
+                await safe_edit(event,
+                    f"✅ استایل «{HTML_STYLES[key]['label']}» انتخاب و روشن شد.\n"
+                    "از این به بعد پیام‌های عادی‌ات ویرایش می‌شوند و استایل می‌گیرند."); return
             if text == f"{CMD}فونت روشن":
                 if users_db["users"].get(str(user_id), {}).get("font_on"):
                     await safe_edit(event, "⚠️ از قبل روشنه."); return
@@ -7754,13 +8500,13 @@ def make_user_handler(user_id):
                 if text == f"{CMD}{as_key} روشن":
                     matched_auto = True
                     if auto_send_status.get(user_id, {}).get(as_key):
-                        await safe_edit(event, f"⚠️ روشن."); return
+                        await safe_edit(event, "⚠️ روشن."); return
                     start_auto_send(user_id, as_key)
                     await safe_edit(event, f"🟢 {as_key} روشن ({format_interval_short(as_cfg['interval'])})."); return
                 if text == f"{CMD}{as_key} خاموش":
                     matched_auto = True
                     if not auto_send_status.get(user_id, {}).get(as_key):
-                        await safe_edit(event, f"⚠️ خاموش."); return
+                        await safe_edit(event, "⚠️ خاموش."); return
                     stop_auto_send(user_id, as_key)
                     await safe_edit(event, f"🔴 {as_key} خاموش."); return
             if matched_auto: return
@@ -7853,12 +8599,13 @@ def make_user_handler(user_id):
                     await safe_edit(event, "⚠️ از قبل روشنه."); return
                 cfg["enabled"] = True
                 schedule_save_runtime()
+                _ensure_transfer_scheduler(user_id, "item")
                 if not sell_mode_users.get(user_id, {}).get("enabled"):
-                    asyncio.create_task(item_scheduler(user_id))
-                async def _run_imm_item_cmd(uid):
-                    async with get_user_lock(uid):
-                        await execute_item_transfers(uid)
-                asyncio.create_task(_run_imm_item_cmd(user_id))
+                    async def _run_imm_item_cmd(uid):
+                        async with get_user_lock(uid):
+                            if not sell_mode_users.get(uid, {}).get("enabled"):
+                                await execute_item_transfers(uid)
+                    _spawn(_run_imm_item_cmd(user_id))
                 await safe_edit(event, "🟢 انتقال کالا روشن شد.\n💡 خاموش: " + CMD + "انتقال کالا خاموش")
                 return
                 
@@ -7907,12 +8654,13 @@ def make_user_handler(user_id):
                     await safe_edit(event, "⚠️ از قبل روشنه."); return
                 cfg["enabled"] = True
                 schedule_save_runtime()
+                _ensure_transfer_scheduler(user_id, "material")
                 if not sell_mode_users.get(user_id, {}).get("enabled"):
-                    asyncio.create_task(material_scheduler(user_id))
-                async def _run_immediate_transfer(uid):
-                    async with get_user_lock(uid):
-                        await execute_material_transfers(uid)
-                asyncio.create_task(_run_immediate_transfer(user_id))
+                    async def _run_immediate_transfer(uid):
+                        async with get_user_lock(uid):
+                            if not sell_mode_users.get(uid, {}).get("enabled"):
+                                await execute_material_transfers(uid)
+                    _spawn(_run_immediate_transfer(user_id))
                 await safe_edit(event, "🟢 انتقال مواد روشن شد.\n💡 خاموش کردن: " + CMD + "انتقال مواد خاموش")
                 return
                 
@@ -7965,7 +8713,7 @@ def make_user_handler(user_id):
                     await safe_edit(event, "❌ شماره عدد باشه."); return
                 target = int(arg_n)
                 await safe_edit(event, f"🔄 تست طبقه {target}...\n📋 نتیجه تو پیوی میاد.")
-                asyncio.create_task(_manual_floor_test(user_id, target)); return
+                _spawn(_manual_floor_test(user_id, target)); return
             # خروج
             if text == f"{CMD}خروج از اکانت":
                 sp = SESSION_DIR / str(user_id)
@@ -8206,26 +8954,45 @@ def make_user_handler(user_id):
                 await safe_edit(event, "✅ لغو شد." if had else "ℹ️ چیزی برای لغو نبود.")
                 return
             if text == f"{CMD}دستورات":
-                await safe_edit(event,
-                    f"📚 دستورات پرکاربرد\n━━━━━━━━━━━━━━━━━\n"
-                    f"🎛 <code>{CMD}پنل</code> — پنل شیشه‌ای\n"
-                    f"🎮 <code>{CMD}پنل بازی</code> — بخش بازی‌ها\n"
-                    f"   ⚔️ <code>{CMD}پنل کاردینال</code>\n"
-                    f"   🐴 <code>{CMD}پنل پونی</code>\n"
-                    f"   🔫 <code>{CMD}پنل پیو</code>\n"
-                    f"📢 <code>{CMD}پنل تبچی</code> — پیام خودکار\n"
-                    f"🛠 <code>{CMD}پنل ابزار</code> — فونت، استایل، TTL، ذخیره\n"
-                    f"📊 <code>{CMD}وضعیت</code> — وضعیت کامل\n"
-                    f"📚 <code>{CMD}راهنما</code> — راهنمای اصلی\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"🔙 <code>{CMD}لغو</code> — لغو عملیات\n"
-                    f"🚪 <code>{CMD}خروج از اکانت</code>")
+                tool_parts = "فونت، استایل"
+                if is_media_allowed(user_id): tool_parts += "، TTL، ذخیره"
+                help_lines = [
+                    "📚 <b>دستورات پرکاربرد</b>", "━━━━━━━━━━━━━━━━━",
+                    f"🎛 <code>{CMD}پنل</code> — پنل شیشه‌ای",
+                    f"🎮 <code>{CMD}پنل بازی</code> — بخش بازی‌ها",
+                    f"⚔️ <code>{CMD}پنل کاردینال</code> · 🐴 <code>{CMD}پنل پونی</code>",
+                    f"🔫 <code>{CMD}پنل پیو</code> · 📢 <code>{CMD}پنل تبچی</code>",
+                    f"🛠 <code>{CMD}پنل ابزار</code> — {tool_parts}",
+                    f"📊 <code>{CMD}وضعیت</code> — وضعیت قابلیت‌ها",
+                    f"📚 <code>{CMD}راهنما</code> — راهنمای اصلی",
+                ]
+                if is_media_allowed(user_id):
+                    help_lines.extend([
+                        "━━━━━━━━━━━━━━━━━",
+                        "🔥 <b>TTL — ذخیرهٔ خودکار رسانه‌های ناپدیدشونده</b>",
+                        f"<code>{CMD}تی تی ال</code> — دیدن وضعیت و مقصد",
+                        f"<code>{CMD}تی تی ال روشن</code> — روشن‌کردن ذخیرهٔ خودکار",
+                        f"<code>{CMD}تی تی ال خاموش</code> — خاموش‌کردن",
+                        f"<code>{CMD}تی تی ال هدف</code> — انتخاب همین گفتگو به‌عنوان مقصد",
+                        "📥 <b>ذخیرهٔ دستی</b>",
+                        f"ریپلای روی رسانه + <code>{CMD}ذخیره</code>؛ یا <code>{CMD}ذخیره &lt;لینک&gt;</code>",
+                    ])
+                help_lines.extend([
+                    "━━━━━━━━━━━━━━━━━",
+                    f"🔙 <code>{CMD}لغو</code> — لغو عملیات",
+                    f"🚪 <code>{CMD}خروج از اکانت</code>",
+                ])
+                await safe_edit(event, "\n".join(help_lines), parse_mode="html")
                 return
-            # پیشنهاد
+            # پیشنهاد فرمان‌ها؛ دستورات رسانه‌ای برای حساب بدون مجوز پنهان می‌مانند.
             if text and text.startswith(CMD) and len(text) > len(CMD):
                 raw = text[len(CMD):].strip()
                 if raw:
-                    matches = get_close_matches(raw, COMMAND_HINTS, n=3, cutoff=0.45)
+                    hints = COMMAND_HINTS
+                    if not is_media_allowed(user_id):
+                        media_commands = {"تی تی ال", "تی تی ال روشن", "تی تی ال خاموش", "تی تی ال هدف", "ذخیره"}
+                        hints = [command for command in COMMAND_HINTS if command not in media_commands]
+                    matches = get_close_matches(raw, hints, n=3, cutoff=0.45)
                     if matches:
                         hint = "\n".join([f"   • {CMD}{m}" for m in matches])
                         await safe_edit(event, f"❓ «{CMD}{raw}» پیدا نشد\n💡 شاید:\n{hint}")
@@ -8264,17 +9031,6 @@ async def _pm_get_user_groups(uid, limit=200):
     return groups
 
 async def _pm_build_main(uid):
-    ping_ms = -1
-    try:
-        t0 = time.time()
-        if bot_client and bot_client.is_connected():
-            await bot_client.get_me()
-            ping_ms = int((time.time() - t0) * 1000)
-    except: pass
-    if ping_ms < 0: ping_str = "❌"
-    elif ping_ms < 50: ping_str = f"🟢{ping_ms}"
-    elif ping_ms < 200: ping_str = f"🟡{ping_ms}"
-    else: ping_str = f"🔴{ping_ms}"
     up = int(time.time() - STATS_START_TIME)
     d, rem = divmod(up, 86400); h, rem = divmod(rem, 3600); m, _ = divmod(rem, 60)
     if d: up_str = f"{d}d {h}h"
@@ -8299,10 +9055,10 @@ async def _pm_build_main(uid):
     (on_list if ft_on else off_list).append("🏰 تست‌طبقه")
     art_on = is_pew_art_enabled(uid)
     (on_list if art_on else off_list).append("🎨 پیوآرت")
-    boss_on = pew_boss_config.get(int(uid), {}).get("enabled", False)
-    (on_list if boss_on else off_list).append("🗡 باس")
     pony_c = sum(1 for k, v in pony_config.items() if k[0] == int(uid) and v.get("collect"))
     if pony_c: on_list.append(f"🐴 پونی×{pony_c}")
+    naz_c = sum(1 for k, v in pony_config.items() if k[0] == int(uid) and v.get("naz_enabled"))
+    if naz_c: on_list.append(f"💞 ناز خودکار×{naz_c}")
     dgn_c = sum(1 for k, v in dungeon_config.items() if k[0] == int(uid) and v.get("enabled"))
     if dgn_c: on_list.append(f"🏰 دانجن×{dgn_c}")
     ring_c = sum(1 for k, v in pew_ring_config.items() if k[0] == int(uid) and v.get("enabled"))
@@ -8322,28 +9078,12 @@ async def _pm_build_main(uid):
         except: conn_str = "🔴 قطع"
     else: conn_str = "🔴 قطع"
     info = users_db["users"].get(str(uid), {})
-    name = (info.get("name") or "—")[:18]
-    role = "👑" if is_grp_owner(uid) else ("👮" if is_manager(uid) else "👤")
-    g = get_user_gender(uid)
-    g_icon = "🩷" if g == "girl" else ("💙" if g == "boy" else "❓")
+    name = html_lib.escape((info.get("name") or "—")[:18])
     lines = []
     lines.append("<b>🎛 پنل مدیریت</b>")
     lines.append("<code>━━━━━━━━━━━━━━━</code>")
-    lines.append(f"{role} {name} · <code>{uid}</code> · {g_icon}")
-    lines.append(f"🔌 {conn_str} · 📡 {ping_str}ms")
-    lines.append(f"⏱ {up_str} · ⚙️ {f_active} فعال")
-    lines.append("<code>━━━━━━━━━━━━━━━</code>")
-    if on_list:
-        lines.append("<b>🟢 فعال:</b>")
-        for i in range(0, len(on_list), 2):
-            lines.append("  " + "  ·  ".join(on_list[i:i+2]))
-    else:
-        lines.append("🔴 <i>هیچ فیچری فعال نیست</i>")
-    if off_list:
-        lines.append("<code>━━━━━━━━━━━━━━━</code>")
-        lines.append("<b>🔴 خاموش:</b>")
-        for i in range(0, len(off_list), 3):
-            lines.append("  " + "  ·  ".join(off_list[i:i+3]))
+    lines.append(f"👤 {name} · <code>{uid}</code>")
+    lines.append(f"{conn_str} · ⏱ {up_str} · ⚙️ {f_active} فعال")
     lines.append("<code>━━━━━━━━━━━━━━━</code>")
     text = "\n".join(lines)
     kb = [
@@ -8362,125 +9102,103 @@ async def _pm_build_main(uid):
     return text, kb
 
 async def _pm_build_status_panel(uid):
-    sell_on = uid in sell_mode_users and sell_mode_users[uid].get("enabled")
+    uid = int(uid)
+    sell_on = uid in sell_mode_users and sell_mode_users[uid].get("enabled", False)
     shkar_on = auto_send_status.get(uid, {}).get("شکار", False)
     siah_on = auto_send_status.get(uid, {}).get("سیاه", False)
     esc_on = is_escape_enabled(uid)
     ret_on = is_return_enabled(uid)
     gift_on = daily_gift_status.get(uid, False)
-    transfer_on = uid in transfer_configs and transfer_configs[uid].get("enabled")
+    transfer_on = transfer_configs.get(uid, {}).get("enabled", False)
+    materials_on = transfer_materials_config.get(uid, {}).get("enabled", False)
+    items_on = transfer_items_config.get(uid, {}).get("enabled", False)
     ft_on = is_floor_test_enabled(uid)
+
+    pony_on = any(c.get("collect") for k, c in pony_config.items()
+                  if k[0] == uid)
+    naz_on = any(c.get("naz_enabled") for k, c in pony_config.items()
+                 if k[0] == uid)
+    dungeon_on = any(c.get("enabled") for k, c in dungeon_config.items()
+                     if k[0] == uid)
     art_on = is_pew_art_enabled(uid)
-    boss_on = pew_boss_config.get(int(uid), {}).get("enabled", False)
-    pony_c = sum(1 for k, v in pony_config.items() if k[0] == int(uid) and v.get("collect"))
-    dgn_c = sum(1 for k, v in dungeon_config.items() if k[0] == int(uid) and v.get("enabled"))
-    ring_c = sum(1 for k, v in pew_ring_config.items() if k[0] == int(uid) and v.get("enabled"))
-    tgt_c = sum(1 for k, v in pew_target_config.items() if k[0] == int(uid) and v.get("enabled"))
-    dog_c = sum(1 for k, v in pew_dog_config.items() if k[0] == int(uid) and v.get("enabled"))
-    banners_active = sum(1 for _, b in get_user_banners(uid).items() if b.get("active"))
+    ring_on = any(v.get("enabled") for k, v in pew_ring_config.items()
+                  if k[0] == uid)
+    target_on = any(v.get("enabled") for k, v in pew_target_config.items()
+                    if k[0] == uid)
+    dog_on = any(v.get("enabled") for k, v in pew_dog_config.items()
+                 if k[0] == uid)
 
-    f_active = sum(1 for x in [sell_on, shkar_on, siah_on, esc_on, ret_on, gift_on,
-                                transfer_on, ft_on, art_on, boss_on] if x)
-    f_active += (1 if pony_c else 0) + (1 if dgn_c else 0) + (1 if ring_c else 0)
-    f_active += (1 if tgt_c else 0) + (1 if dog_c else 0) + (1 if banners_active else 0)
+    user_cfg = users_db.get("users", {}).get(str(uid), {})
+    tools = [
+        ("استایل HTML", user_cfg.get("html_style_on", False)),
+        ("فونت انگلیسی", user_cfg.get("font_on", False)),
+    ]
+    if is_media_allowed(uid):
+        tools.append(("ذخیرهٔ خودکار TTL", get_ttl_config(uid)["enabled"]))
+    tools.extend([
+        ("پایش پروفایل", monitor_db.get(str(uid), {}).get("enabled", False)),
+        ("چرخش ایموجی اسم", get_name_emoji_config(uid).get("enabled", False)),
+        ("چرخش عکس پروفایل", get_random_profile_config(uid).get("enabled", False)),
+    ])
 
-    # گروه‌بندی فعال
-    groups_on = []
-    cardinal = []
-    if sell_on: cardinal.append(f"💰 فروش")
-    if shkar_on: cardinal.append(f"🎯 شکار")
-    if siah_on: cardinal.append(f"💀 سیاه")
-    if esc_on: cardinal.append(f"🏃 فرار")
-    if ret_on: cardinal.append(f"🔙 برگشت")
-    if gift_on: cardinal.append(f"🎁 جایزه")
-    if transfer_on: cardinal.append(f"💸 انتقال")
-    if ft_on: cardinal.append(f"🏰 تست طبقه")
-    if cardinal:
-        groups_on.append(("⚔️ کاردینال", cardinal))
-    pony_g = []
-    if pony_c: pony_g.append(f"🐴 پونی×{pony_c}")
-    if dgn_c: pony_g.append(f"🏰 دانجن×{dgn_c}")
-    if pony_g:
-        groups_on.append(("🎠 پونی‌لند", pony_g))
-    pew_g = []
-    if art_on: pew_g.append(f"🎨 فن‌آرت")
-    if ring_c: pew_g.append(f"🏋️ رینگ×{ring_c}")
-    if tgt_c: pew_g.append(f"🎯 هدف×{tgt_c}")
-    if dog_c: pew_g.append(f"🐕 سگ×{dog_c}")
-    if boss_on: pew_g.append(f"🗡 باس")
-    if pew_g:
-        groups_on.append(("🔫 پیوپیو", pew_g))
-    if banners_active:
-        groups_on.append(("📢 تبچی", [f"📢 فعال×{banners_active}"]))
+    banners = get_user_banners(uid)
+    active_banners = [name for name, cfg in banners.items() if cfg.get("active")]
 
-    # گروه‌بندی خاموش
-    groups_off = []
-    cardinal_off = []
-    if not sell_on: cardinal_off.append("💰 فروش")
-    if not shkar_on: cardinal_off.append("🎯 شکار")
-    if not siah_on: cardinal_off.append("💀 سیاه")
-    if not esc_on: cardinal_off.append("🏃 فرار")
-    if not ret_on: cardinal_off.append("🔙 برگشت")
-    if not gift_on: cardinal_off.append("🎁 جایزه")
-    if not transfer_on: cardinal_off.append("💸 انتقال")
-    if not ft_on: cardinal_off.append("🏰 تست طبقه")
-    if cardinal_off:
-        groups_off.append(("⚔️ کاردینال", cardinal_off))
-    pony_off = []
-    if not pony_c: pony_off.append("🐴 پونی")
-    if not dgn_c: pony_off.append("🏰 دانجن")
-    if pony_off:
-        groups_off.append(("🎠 پونی‌لند", pony_off))
-    pew_off = []
-    if not art_on: pew_off.append("🎨 فن‌آرت")
-    if not ring_c: pew_off.append("🏋️ رینگ")
-    if not tgt_c: pew_off.append("🎯 هدف")
-    if not dog_c: pew_off.append("🐕 سگ")
-    if not boss_on: pew_off.append("🗡 باس")
-    if pew_off:
-        groups_off.append(("🔫 پیوپیو", pew_off))
-    if not banners_active:
-        groups_off.append(("📢 تبچی", ["📢 خاموش"]))
-
-    c = user_clients.get(int(uid))
-    if c and c.is_connected():
+    client = user_clients.get(uid)
+    if client and client.is_connected():
         try:
-            ok = await c.is_user_authorized()
-            conn_str = "🟢 آنلاین" if ok else "🟡 ناشناس"
-        except: conn_str = "🔴 قطع"
-    else: conn_str = "🔴 قطع"
-    up = int(time.time() - STATS_START_TIME)
-    d, rem = divmod(up, 86400); h, rem = divmod(rem, 3600); m, _ = divmod(rem, 60)
-    if d: up_str = f"{d}d {h}h"
-    elif h: up_str = f"{h}h {m}m"
-    else: up_str = f"{m}m"
+            connected = await client.is_user_authorized()
+            conn_str = "آنلاین" if connected else "نیازمند ورود"
+        except Exception:
+            conn_str = "وضعیت نامشخص"
+    else:
+        conn_str = "قطع"
+    uptime = format_interval_persian(int(time.time() - STATS_START_TIME))
+    uptime = uptime.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
-    lines = []
-    lines.append("📊 <b>وضعیت فیچرها</b>")
-    lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append(f"🔌 {conn_str}")
-    lines.append(f"⏱ {up_str}  ·  ⚙️ <b>{f_active}</b> فعال")
+    lines = [
+        "📊 <b>وضعیت قابلیت‌ها</b>",
+        "━━━━━━━━━━━━━━━━━",
+        f"🔌 اتصال اکانت: <b>{conn_str}</b>",
+        f"⏱ مدت اجرای ربات: <b>{uptime}</b>",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+
+    def add_status_group(title, features):
+        enabled = [name for name, state in features if state]
+        disabled = [name for name, state in features if not state]
+        lines.append("")
+        lines.append(f"<b>{title}</b>")
+        lines.append("🟢 روشن: " + ("، ".join(enabled) if enabled else "—"))
+        lines.append("🔴 خاموش: " + ("، ".join(disabled) if disabled else "—"))
+
+    add_status_group("⚔️ کاردینال", [
+        ("فروش", sell_on), ("شکار", shkar_on), ("سیاه‌چال", siah_on),
+        ("فرار", esc_on), ("برگشت", ret_on), ("جایزه", gift_on),
+        ("انتقال", transfer_on), ("انتقال مواد", materials_on),
+        ("انتقال کالا", items_on), ("تست طبقه", ft_on),
+    ])
+    add_status_group("🐴 پونی‌لند", [
+        ("پونی", pony_on), ("ناز خودکار", naz_on), ("دانجن", dungeon_on),
+    ])
+    add_status_group("🔫 پیوپیو", [
+        ("شکار فن‌آرت", art_on), ("پیو رینگ", ring_on),
+        ("پیو هدف", target_on), ("پیو سگ", dog_on),
+    ])
+    add_status_group("🧰 ابزارها", tools)
+
     lines.append("")
-    if groups_on:
-        lines.append("✅ <b>فعال</b>")
-        lines.append("─────────────────")
-        for gname, items in groups_on:
-            lines.append(f"<b>{gname}</b>")
-            for i in range(0, len(items), 3):
-                lines.append("  " + " · ".join(items[i:i+3]))
-        lines.append("")
-    if groups_off:
-        lines.append("❌ <b>خاموش</b>")
-        lines.append("─────────────────")
-        for gname, items in groups_off:
-            lines.append(f"<b>{gname}</b>")
-            for i in range(0, len(items), 3):
-                lines.append("  " + " · ".join(items[i:i+3]))
-        lines.append("")
+    lines.append("<b>📢 تبچی</b>")
+    if active_banners:
+        count = str(len(active_banners)).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+        lines.append(f"🟢 روشن: {count} بنر فعال")
+    else:
+        lines.append("🔴 خاموش: بنری در حال ارسال نیست")
     lines.append("━━━━━━━━━━━━━━━━━")
+
     text = "\n".join(lines)
     kb = [
-        [_cb("🔄 بروزرسانی", "pn_status_panel")],
+        [_cb("🔄 بروزرسانی وضعیت", "pn_status_panel")],
         [_cb("⚪ 🔙 بازگشت", "pn_refresh")],
     ]
     return text, kb
@@ -8499,10 +9217,11 @@ async def _pm_build_games(uid):
         "━━━━━━━━━━━━━━━━━\n"
         "👇 یکی رو انتخاب کن:"
     )
+    # Isolate Latin labels from the surrounding RTL interface so emojis stay with their button.
     kb = [
-        [_cb("⚔ کاردینال", "pn_cardinal_panel")],
-        [_cb("🐴 پونی", "pn_pony_pick")],
-        [_cb("🔫 پیو پیو", "pn_pew_panel")],
+        [_cb("\u2066Cardinal⚔️\u2069", "pn_cardinal_panel")],
+        [_cb("\u2066Pony🐴\u2069", "pn_pony_main")],
+        [_cb("\u2066PewPew🔫\u2069", "pn_pew_panel")],
         [_cb("⚪ 🔙 بازگشت", "pn_refresh")],
     ]
     return text, kb
@@ -8512,11 +9231,9 @@ async def _pm_build_games(uid):
 async def _pm_build_cardinal_panel(uid):
     sell_on = uid in sell_mode_users and sell_mode_users[uid].get("enabled")
     esc_on = is_escape_enabled(uid)
-    ret_on = is_return_enabled(uid)
     gift_on = daily_gift_status.get(uid, False)
     shkar_on = auto_send_status.get(uid, {}).get("شکار", False)
     siah_on = auto_send_status.get(uid, {}).get("سیاه", False)
-    transfer_on = uid in transfer_configs and transfer_configs[uid].get("enabled")
     ft_on = is_floor_test_enabled(uid)
     ft_max = get_max_fails(uid)
     lines = ["⚔ کاردینال", "━━━━━━━━━━━━━━━━━", "👇 یه بخش انتخاب کن:"]
@@ -8596,7 +9313,7 @@ async def _pm_build_war_attack(uid):
         "📋 دستورات (توی گروه مقصد):\n\n"
         f"🎬 ساختن تیم:\n   {CMD}حمله تیمی ایجاد <اسم>\n\n"
         f"✅ پیوستن:\n   {CMD}حمله تیمی روشن <اسم>\n   {CMD}حمله تیمی خاموش <اسم>  ← خروج\n\n"
-        f"⚔️ حمله:\n   {CMD}حمله تیمی به <اسم> <C_ID>\n\n"
+        f"⚔️ حمله:\n   {CMD}حمله تیمی به &lt;اسم&gt; &lt;C_ID&gt;\n\n"
         f"📊 مشاهده:\n   {CMD}حمله تیمی لیست\n\n"
         "⚠️ حداکثر ۷ نفر تو هر تیم"
     )
@@ -8628,8 +9345,6 @@ async def _pm_build_pew_panel(uid):
     tgt_total = sum(1 for k in pew_target_config if k[0] == int(uid))
     dog_count = sum(1 for k, v in pew_dog_config.items() if k[0] == int(uid) and v.get("enabled"))
     dog_total = sum(1 for k in pew_dog_config if k[0] == int(uid))
-    boss_on = pew_boss_config.get(int(uid), {}).get("enabled", False)
-    boss_kills = pew_boss_stats.get(int(uid), {}).get("kills", 0)
     text = (
         "پیو پیو 🔫\n"
         "━━━━━━━━━━━━━━━━━\n"
@@ -8637,7 +9352,6 @@ async def _pm_build_pew_panel(uid):
         f"🏋️ پیو رینگ: {'🟢' if ring_count else '🔴'} {ring_count}/{ring_total}\n"
         f"🎯 هدف: {'🟢' if tgt_count else '🔴'} {tgt_count}/{tgt_total}\n"
         f"🐕 سگ: {'🟢' if dog_count else '🔴'} {dog_count}/{dog_total}\n"
-        f"🗡 باس ۱٪: {'🟢' if boss_on else '🔴'}  ·  🏆 {boss_kills}\n"
         "━━━━━━━━━━━━━━━━━"
     )
     kb = [
@@ -8645,7 +9359,6 @@ async def _pm_build_pew_panel(uid):
         [_cb("🏋️ پیو رینگ", "pn_pewring_master_panel")],
         [_cb("🛡 شکار گروهی", "pn_ghunt_panel")],
         [_cb("🐕 سگ", "pn_dog_master_panel")],
-        [_cb(f"{'🔴 خاموش' if boss_on else '🟢 روشن'} باس ۱٪", "pn_boss_toggle")],
         [_cb("⚪ 🔙 بازگشت", "pn_games")],
     ]
     return text, kb
@@ -8659,7 +9372,7 @@ async def _pm_build_pew_art_panel(uid):
         "━━━━━━━━━━━━━━━━━\n"
         f"🎉 گرفتی: {stats['grabbed']}\n🕸 دیر رسیدی: {stats['missed']}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "وقتی روشنه، به محض دیدن پیام\n«فن‌آرت جدید» خودکار ریپلای می‌کنه\nو /art می‌فرسته.\n"
+        "وقتی روشنه، در هر گروه پیام‌هایی مثل\n«یه فن‌آرت جدید اومد» یا «افتاد» رو\nبا هر اسم کاراکتری تشخیص می‌ده؛ سپس\nروی همان پیام ریپلای می‌کنه و /art می‌فرسته.\n"
         "━━━━━━━━━━━━━━━━━"
     )
     kb = [
@@ -8917,10 +9630,10 @@ async def _sync_hunt_handler(event, user_id):
     text = (event.raw_text or "").strip()
     if not text: return
     
-    norm = _normalize_persian(text).lower()
-    keywords = ["شلیک", "پیو هیل", "پیو باس حمله", "جیز"]
-    matched = any(kw in norm for kw in keywords)
-    if not matched: return
+    norm = _normalize_persian(text).replace("ي", "ی").replace("ك", "ک").lower().strip()
+    # Only mirror a dedicated keyword message, never a sentence that merely contains it.
+    keywords = {"شلیک", "پیو هیل", "پیو باس حمله", "جیز"}
+    if norm not in keywords: return
     
     code = pew_user_group[user_id]
     grp = pew_hunt_groups.get(code)
@@ -9143,6 +9856,634 @@ async def _pm_build_pew_target_group_picker(uid, tid, page=0, old_cid=None, mode
     kb.append([_cb("لغو 🔙", back_data)])
     return "\n".join(lines), kb
 
+def get_user_notifs(uid):
+    user = users_db.setdefault("users", {}).setdefault(str(int(uid)), {})
+    notifs = user.setdefault("notifications", {})
+    defaults = {"mat_trans": True, "item_trans": True, "sell": True,
+                "monitor": True, "emoji_name": True}
+    for key, value in defaults.items():
+        notifs.setdefault(key, value)
+    return notifs
+
+
+def save_user_notifs(uid):
+    get_user_notifs(uid)
+    save_json(USERS_FILE, users_db)
+
+
+def _save_monitor_db():
+    save_json(MONITOR_FILE, monitor_db)
+
+
+async def _read_monitor_profile(client, target_id):
+    entity = await client.get_entity(int(target_id))
+    input_peer = await client.get_input_entity(entity)
+    input_user = types.InputUser(user_id=input_peer.user_id,
+                                 access_hash=input_peer.access_hash)
+    full = await client(GetFullUserRequest(input_user))
+    full_users = list(getattr(full, "users", []) or [])
+    user = next((item for item in full_users
+                 if int(getattr(item, "id", 0)) == int(target_id)), None)
+    if user is None and full_users:
+        user = full_users[0]
+    if user is None:
+        raise ValueError("پروفایل قابل خواندن نیست")
+    full_info = getattr(full, "full_user", None)
+    return {
+        "name": " ".join(x for x in [getattr(user, "first_name", ""),
+                                      getattr(user, "last_name", "")] if x).strip(),
+        "username": getattr(user, "username", "") or "",
+        "bio": getattr(full_info, "about", "") or "",
+    }
+
+
+async def _monitor_add_target(uid, event, arg=""):
+    client = user_clients.get(int(uid))
+    if not client or not client.is_connected():
+        client = await ensure_user_client(uid)
+    if not client:
+        return False, "❌ اکانت متصل نیست."
+    try:
+        target_id = await resolve_user_arg(event, client, arg)
+        if not target_id:
+            return False, f"❌ فرد پیدا نشد. آیدی/یوزرنیم بفرست یا روی پیامش ریپلای کن. نمونه: {CMD}پایش افزودن @username"
+        entity = await client.get_entity(int(target_id))
+        if getattr(entity, "bot", False):
+            return False, "❌ برای پایش، یک حساب کاربری انتخاب کن؛ بات پذیرفته نیست."
+        snap = await _read_monitor_profile(client, target_id)
+        cfg = monitor_db.setdefault(str(int(uid)), {"enabled": False, "users": {}})
+        users = cfg.setdefault("users", {})
+        tid = str(int(target_id))
+        if tid in users:
+            return False, "⚠️ این فرد از قبل در فهرست پایش است."
+        users[tid] = {
+            "enabled": True, "history": [], "last_name": snap["name"],
+            "last_uname": snap["username"], "last_bio": snap["bio"]}
+        _save_monitor_db()
+        uname = f"@{snap['username']}" if snap["username"] else "—"
+        return True, (f"✅ به فهرست پایش اضافه شد.\n👤 {snap['name'] or target_id}"
+                      f"\n🔗 {uname}\n🆔 {target_id}")
+    except Exception as e:
+        log_error(f"monitor add {uid}: {_translate_bot_errors(e)}")
+        return False, f"❌ دریافت پروفایل ناموفق بود: {_translate_bot_errors(e)}"
+
+
+async def profile_monitor_loop(uid):
+    uid = int(uid)
+    key = str(uid)
+    task = asyncio.current_task()
+    try:
+        while monitor_db.get(key, {}).get("enabled", False):
+            await asyncio.sleep(600)
+            cfg = monitor_db.get(key, {})
+            if not cfg.get("enabled", False):
+                break
+            if not is_user_active(uid) or not is_user_allowed(uid):
+                break
+            client = user_clients.get(uid)
+            if not client or not client.is_connected():
+                client = await ensure_user_client(uid)
+            if not client:
+                continue
+            changed_any = False
+            for target_id, data in list(cfg.get("users", {}).items()):
+                if not data.get("enabled", True):
+                    continue
+                try:
+                    current = await _read_monitor_profile(client, target_id)
+                    changes = []
+                    old_name = data.get("last_name", "")
+                    old_username = data.get("last_uname", "")
+                    old_bio = data.get("last_bio", "")
+                    if old_name != current["name"]:
+                        changes.append(f"نام: {old_name or '—'} ➡️ {current['name'] or '—'}")
+                    if old_username != current["username"]:
+                        before = f"@{old_username}" if old_username else "—"
+                        after = f"@{current['username']}" if current["username"] else "—"
+                        changes.append(f"یوزرنیم: {before} ➡️ {after}")
+                    if old_bio != current["bio"]:
+                        changes.append("بیو تغییر کرد")
+                    data["last_name"] = current["name"]
+                    data["last_uname"] = current["username"]
+                    data["last_bio"] = current["bio"]
+                    if changes:
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        history = data.setdefault("history", [])
+                        for change in reversed(changes):
+                            history.insert(0, {"time": now_str, "change": change})
+                        data["history"] = history[:5]
+                        changed_any = True
+                        if get_user_notifs(uid).get("monitor", True):
+                            name = current["name"] or str(target_id)
+                            await _notify_user(uid,
+                                f"👁 پایش پروفایل\n👤 {name}\n" + "\n".join(changes))
+                except Exception as e:
+                    log_error(f"profile monitor {uid}/{target_id}: {_translate_bot_errors(e)}")
+            if changed_any:
+                _save_monitor_db()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log_error(f"profile_monitor_loop {uid}: {_translate_bot_errors(e)}")
+    finally:
+        if monitor_tasks.get(key) is task:
+            monitor_tasks.pop(key, None)
+
+
+def start_monitor_task(uid):
+    key = str(int(uid))
+    task = monitor_tasks.get(key)
+    if task and not task.done():
+        return False
+    monitor_tasks[key] = asyncio.create_task(profile_monitor_loop(int(uid)))
+    return True
+
+
+def stop_monitor_task(uid):
+    key = str(int(uid))
+    task = monitor_tasks.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _pm_build_monitor_main(uid):
+    cfg = monitor_db.setdefault(str(int(uid)), {"enabled": False, "users": {}})
+    is_on = bool(cfg.get("enabled", False))
+    count = len(cfg.get("users", {}))
+    text = (
+        "👁 <b>پایش پروفایل</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📊 وضعیت سراسری: {'🟢 روشن' if is_on else '🔴 خاموش'}\n"
+        f"👥 افراد در فهرست: {count}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "پروفایل افراد منتخب هر ۱۰ دقیقه بررسی می‌شود."
+    )
+    kb = [
+        [_cb("🔴 خاموش کن" if is_on else "🟢 روشن کن", "pn_mon_toggle_all")],
+        [_cb("➕ افزودن فرد", "pn_mon_add"), _cb("📋 فهرست افراد", "pn_mon_list_0")],
+        [_cb("⚪ 🔙 بازگشت", "pn_tools")],
+    ]
+    return text, kb
+
+
+async def _pm_build_monitor_list(uid, page=0):
+    cfg = monitor_db.get(str(int(uid)), {"users": {}})
+    users = list(cfg.get("users", {}).items())
+    per_page = 6
+    total = len(users)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(int(page), total_pages - 1))
+    chunk = users[page * per_page:(page + 1) * per_page]
+    lines = [f"📋 <b>فهرست پایش</b> — {total} نفر",
+             f"📄 صفحه {page+1}/{total_pages}", "━━━━━━━━━━━━━━━━━"]
+    kb = []
+    for tid, data in chunk:
+        icon = "🟢" if data.get("enabled", True) else "🔴"
+        name = data.get("last_name") or str(tid)
+        uname = f" · @{data['last_uname']}" if data.get("last_uname") else ""
+        kb.append([_cb(f"{icon} {name[:22]}{uname[:20]}", f"pn_mon_v_{tid}")])
+    nav = []
+    if page > 0: nav.append(_cb("⬅️ قبلی", f"pn_mon_list_{page-1}"))
+    if page < total_pages - 1: nav.append(_cb("بعدی ➡️", f"pn_mon_list_{page+1}"))
+    if nav: kb.append(nav)
+    kb.append([_cb("➕ افزودن فرد", "pn_mon_add")])
+    kb.append([_cb("⚪ 🔙 بازگشت", "pn_mon_main")])
+    return "\n".join(lines), kb
+
+
+async def _pm_build_monitor_view(uid, target_id):
+    cfg = monitor_db.get(str(int(uid)), {}).get("users", {})
+    data = cfg.get(str(target_id))
+    if not data:
+        return "❌ فرد در فهرست پایش نیست.", [[_cb("🔙 بازگشت", "pn_mon_list_0")]]
+    name = html_lib.escape(data.get("last_name") or str(target_id))
+    username = html_lib.escape("@" + data["last_uname"] if data.get("last_uname") else "—")
+    bio = html_lib.escape(data.get("last_bio") or "—")
+    history = "".join(
+        f"• [{html_lib.escape(str(item.get('time', '')))}] {html_lib.escape(str(item.get('change', '')))}\n"
+        for item in data.get("history", [])[:5]) or "تغییری ثبت نشده.\n"
+    enabled = bool(data.get("enabled", True))
+    text = (
+        f"👤 <b>{name}</b>\n🆔 <code>{target_id}</code>\n🔗 {username}\n"
+        f"📝 بیو: {bio[:120]}\n📊 وضعیت: {'🟢 فعال' if enabled else '🔴 خاموش'}\n"
+        "━━━━━━━━━━━━━━━━━\n🕒 <b>آخرین تغییرها</b>\n" + history
+    )
+    kb = [
+        [_cb("🔴 خاموش کن" if enabled else "🟢 روشن کن", f"pn_mon_t_{target_id}")],
+        [_cb("🗑 حذف از فهرست", f"pn_mon_del_{target_id}")],
+        [_cb("⚪ 🔙 بازگشت", "pn_mon_list_0")],
+    ]
+    return text, kb
+
+
+async def _pm_build_tts_panel(uid):
+    gender = users_db["users"].get(str(uid), {}).get("voice_gender", "female")
+    gender_label = "👩 زن" if gender == "female" else "👨 مرد"
+    text = (
+        "🔊 <b>تبدیل متن و ویس</b>\n━━━━━━━━━━━━━━━━━\n"
+        f"🎙 صدای پیش‌فرض: {gender_label}\n━━━━━━━━━━━━━━━━━\n"
+        "از دکمه‌های زیر هم می‌توانی متن را ویس یا ویس را متن کنی.\n"
+        "📌 دستورهای متنی با ویرگول فارسی شروع می‌شوند:\n"
+        f"• <code>{CMD}ویس &lt;متن&gt;</code>\n"
+        f"• <code>{CMD}ویس زن &lt;متن&gt;</code> / <code>{CMD}ویس مرد &lt;متن&gt;</code>\n"
+        f"• روی ویس ریپلای کن و بنویس <code>{CMD}گوش کن</code> برای تبدیل به متن."
+    )
+    kb = [
+        [_cb("👩 صدای پیش‌فرض: زن", "pn_tts_set_female"),
+         _cb("👨 صدای پیش‌فرض: مرد", "pn_tts_set_male")],
+        [_cb("📝 متن را ویس کن", "pn_tts_text_start"),
+         _cb("🎧 ویس را متن کن", "pn_tts_voice_start")],
+        [_cb("⚪ 🔙 بازگشت", "pn_tools")],
+    ]
+    return text, kb
+
+
+async def _send_tts_voice(event, text, gender=None):
+    text = (text or "").strip()
+    if not text:
+        await event.reply(f"متن را هم بنویس. نمونه: <code>{CMD}ویس سلام</code>", parse_mode="html")
+        return
+    if len(text) > 1500:
+        await event.reply("❌ متن برای تبدیل صوتی خیلی طولانی است؛ حداکثر ۱۵۰۰ نویسه بفرست.")
+        return
+    gender = gender or users_db["users"].get(str(event.sender_id), {}).get("voice_gender", "female")
+    voice = "fa-IR-DilaraNeural" if gender == "female" else "fa-IR-FaridNeural"
+    path = None
+    try:
+        import tempfile
+        import edge_tts
+        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3")
+        os.close(fd)
+        await edge_tts.Communicate(text, voice).save(path)
+        await event.client.send_file(event.chat_id, path, voice_note=True,
+                                     reply_to=getattr(event, "id", None))
+    except Exception as e:
+        log_error(f"tts {event.sender_id}: {_translate_bot_errors(e)}")
+        await event.reply(f"❌ تبدیل متن به صدا انجام نشد: {_translate_bot_errors(e)}")
+    finally:
+        if path:
+            try: os.remove(path)
+            except: pass
+
+
+async def _transcribe_voice_message(event, voice_message):
+    if not voice_message or not (getattr(voice_message, "voice", None) or getattr(voice_message, "audio", None)):
+        await event.reply("❌ ویس یا فایل صوتی قابل‌خواندن نیست.")
+        return
+    size = getattr(getattr(voice_message, "file", None), "size", 0) or 0
+    if size > 20 * 1024 * 1024:
+        await event.reply("❌ فایل صوتی بزرگ است؛ حداکثر ۲۰ مگابایت پشتیبانی می‌شود.")
+        return
+    try:
+        import tempfile
+        import speech_recognition as sr
+        with tempfile.TemporaryDirectory(prefix="stt_") as tmp:
+            source_path = os.path.join(tmp, "source.ogg")
+            wav_path = os.path.join(tmp, "audio.wav")
+            downloaded = await event.client.download_media(voice_message, file=source_path)
+            if not downloaded:
+                await event.reply("❌ دانلود ویس ناموفق بود.")
+                return
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-y", "-i", str(downloaded),
+                "-ac", "1", "-ar", "16000", wav_path,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.communicate()
+            if proc.returncode != 0 or not os.path.exists(wav_path):
+                await event.reply("❌ تبدیل ویس ناموفق بود؛ نصب بودن ffmpeg را بررسی کن.")
+                return
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio = recognizer.record(source, duration=120)
+            transcript = recognizer.recognize_google(audio, language="fa-IR")
+            await event.reply("📝 متن ویس:\n" + transcript)
+    except FileNotFoundError:
+        await event.reply("❌ برای تبدیل ویس، ffmpeg باید روی سرور نصب باشد.")
+    except Exception as e:
+        log_error(f"voice recognition {event.sender_id}: {_translate_bot_errors(e)}")
+        await event.reply(f"❌ تشخیص گفتار انجام نشد: {_translate_bot_errors(e)}")
+
+
+async def _transcribe_voice_reply(event):
+    reply = await event.get_reply_message()
+    if not reply or not (getattr(reply, "voice", None) or getattr(reply, "audio", None)):
+        await event.reply(f"روی یک ویس/فایل صوتی ریپلای کن و بنویس <code>{CMD}گوش کن</code>.", parse_mode="html")
+        return
+    await _transcribe_voice_message(event, reply)
+
+
+def get_name_emoji_config(uid):
+    user = users_db.setdefault("users", {}).setdefault(str(int(uid)), {})
+    cfg = user.setdefault("name_emoji", {})
+    cfg.setdefault("enabled", False)
+    cfg.setdefault("emojis", list(NAME_EMOJI_PRESETS[:5]))
+    cfg.setdefault("custom_emojis", [])
+    cfg.setdefault("current_index", 0)
+    cfg.setdefault("position", "start")
+    cfg.setdefault("interval", 60)
+    cfg.setdefault("profile_saved", False)
+    cfg.setdefault("original_first_name", "")
+    cfg.setdefault("original_last_name", "")
+    return cfg
+
+
+async def _update_name_with_emoji(uid, emoji):
+    client = user_clients.get(int(uid))
+    if not client or not client.is_connected():
+        client = await ensure_user_client(uid)
+    if not client:
+        return False
+    cfg = get_name_emoji_config(uid)
+    if not cfg.get("profile_saved"):
+        me = await client.get_me()
+        cfg["original_first_name"] = getattr(me, "first_name", "") or ""
+        cfg["original_last_name"] = getattr(me, "last_name", "") or ""
+        cfg["profile_saved"] = True
+    first_name = str(cfg.get("original_first_name", "") or "")
+    last_name = str(cfg.get("original_last_name", "") or "")
+    if cfg.get("position", "start") == "start":
+        first_name = f"{emoji} {first_name}".strip()[:64]
+    else:
+        last_name = f"{last_name} {emoji}".strip()[:64]
+    await client(UpdateProfileRequest(first_name=first_name, last_name=last_name))
+    return True
+
+
+async def _restore_original_profile_name(uid):
+    cfg = get_name_emoji_config(uid)
+    if not cfg.get("profile_saved"):
+        return True
+    client = user_clients.get(int(uid))
+    if not client or not client.is_connected():
+        client = await ensure_user_client(uid)
+    if not client:
+        return False
+    await client(UpdateProfileRequest(
+        first_name=str(cfg.get("original_first_name", "")),
+        last_name=str(cfg.get("original_last_name", "") or "")))
+    return True
+
+
+async def name_emoji_loop(user_id):
+    uid = int(user_id)
+    task = asyncio.current_task()
+    try:
+        while True:
+            cfg = get_name_emoji_config(uid)
+            if not cfg.get("enabled") or not is_user_active(uid) or not is_user_allowed(uid):
+                break
+            emojis = list(dict.fromkeys(cfg.get("emojis", [])))
+            if not emojis:
+                await asyncio.sleep(5)
+                continue
+            index = int(cfg.get("current_index", 0) or 0) % len(emojis)
+            emoji = emojis[index]
+            try:
+                ok = await _update_name_with_emoji(uid, emoji)
+                if ok:
+                    cfg["current_index"] = (index + 1) % len(emojis)
+                    cfg["last_error_notice"] = 0
+                    save_json(USERS_FILE, users_db)
+            except asyncio.CancelledError:
+                raise
+            except FloodWaitError as e:
+                wait_seconds = max(60, int(getattr(e, "seconds", 60) or 60))
+                log_error(f"name emoji FloodWait {uid}: waiting {wait_seconds}s")
+                await _notify_name_emoji_failure(uid, f"تلگرام محدودیت موقت گذاشت؛ {wait_seconds} ثانیه صبر می‌کنم.")
+                await asyncio.sleep(wait_seconds)
+            except Exception as e:
+                log_error(f"name emoji {uid}: {_translate_bot_errors(e)}")
+                await _notify_name_emoji_failure(uid, _translate_bot_errors(e))
+            # Apply interval/position changes from the panel during the current wait.
+            sent_at = time.monotonic()
+            while get_name_emoji_config(uid).get("enabled"):
+                interval = max(60, int(get_name_emoji_config(uid).get("interval", 60) or 60))
+                remaining = interval - (time.monotonic() - sent_at)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1, remaining))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log_error(f"name_emoji_loop {uid}: {_translate_bot_errors(e)}")
+    finally:
+        if name_emoji_tasks.get(uid) is task:
+            name_emoji_tasks.pop(uid, None)
+
+
+def start_name_emoji_task(user_id):
+    uid = int(user_id)
+    task = name_emoji_tasks.get(uid)
+    if task and not task.done():
+        return False
+    name_emoji_tasks[uid] = asyncio.create_task(name_emoji_loop(uid))
+    return True
+
+
+def stop_name_emoji_task(user_id):
+    uid = int(user_id)
+    task = name_emoji_tasks.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _notify_name_emoji_failure(uid, reason):
+    cfg = get_name_emoji_config(uid)
+    now = time.time()
+    if now - float(cfg.get("last_error_notice", 0) or 0) < 3600:
+        return
+    cfg["last_error_notice"] = now
+    save_json(USERS_FILE, users_db)
+    await _notify_feature(uid, "emoji_name", f"⚠️ تغییر ایموجی اسم انجام نشد: {reason}")
+
+
+def get_random_profile_config(uid):
+    user = users_db.setdefault("users", {}).setdefault(str(int(uid)), {})
+    cfg = user.setdefault("random_profile", {})
+    cfg.setdefault("enabled", False)
+    cfg.setdefault("interval", 60)
+    cfg.setdefault("photo_ids", [])
+    cfg.setdefault("next_index", 0)
+    cfg.setdefault("last_error_notice", 0)
+    return cfg
+
+
+def _as_input_profile_photo(photo):
+    photo_id = getattr(photo, "id", None)
+    access_hash = getattr(photo, "access_hash", None)
+    if photo_id is None or access_hash is None:
+        return None
+    return types.InputPhoto(
+        id=int(photo_id), access_hash=int(access_hash),
+        file_reference=bytes(getattr(photo, "file_reference", b"") or b""))
+
+
+async def _load_own_profile_photos(uid):
+    client = user_clients.get(int(uid))
+    if not client or not client.is_connected():
+        client = await ensure_user_client(uid)
+    if not client:
+        raise RuntimeError("اکانت تلگرام متصل نیست.")
+    photos = await client.get_profile_photos("me")
+    valid = [(int(p.id), p) for p in photos if _as_input_profile_photo(p)]
+    return client, valid
+
+
+async def set_random_profile_enabled(uid, enabled):
+    cfg = get_random_profile_config(uid)
+    if not enabled:
+        cfg["enabled"] = False
+        save_json(USERS_FILE, users_db)
+        stop_random_profile_task(uid)
+        return True, "🔴 چرخش عکس پروفایل خاموش شد؛ عکس فعلی دست‌نخورده می‌ماند."
+    try:
+        _client, photos = await _load_own_profile_photos(uid)
+    except Exception as e:
+        return False, f"❌ دریافت عکس‌های پروفایل ممکن نشد: {_translate_bot_errors(e)}"
+    photo_ids = [photo_id for photo_id, _ in photos]
+    if len(photo_ids) < 2:
+        cfg["enabled"] = False
+        cfg["photo_ids"] = photo_ids
+        save_json(USERS_FILE, users_db)
+        return False, f"❌ حداقل ۲ عکس در گالری پروفایل لازم است؛ اکنون {len(photo_ids)} عکس پیدا شد."
+    cfg["photo_ids"] = photo_ids
+    cfg["next_index"] = 0
+    cfg["interval"] = int(cfg.get("interval", 60) or 60)
+    if cfg["interval"] not in (60, 300, 600):
+        cfg["interval"] = 60
+    cfg["enabled"] = True
+    save_json(USERS_FILE, users_db)
+    start_random_profile_task(uid)
+    return True, f"🟢 چرخش روشن شد؛ {len(photo_ids)} عکس به‌ترتیب گالری بررسی می‌شوند."
+
+
+async def _notify_random_profile_issue(uid, message):
+    cfg = get_random_profile_config(uid)
+    now = time.time()
+    if now - float(cfg.get("last_error_notice", 0) or 0) < 3600:
+        return
+    cfg["last_error_notice"] = now
+    save_json(USERS_FILE, users_db)
+    await _notify_user(uid, message)
+
+
+async def random_profile_loop(user_id):
+    uid = int(user_id)
+    task = asyncio.current_task()
+    try:
+        while True:
+            cfg = get_random_profile_config(uid)
+            if not cfg.get("enabled") or not is_user_active(uid) or not is_user_allowed(uid):
+                break
+            try:
+                client, photos = await _load_own_profile_photos(uid)
+                photo_map = {photo_id: photo for photo_id, photo in photos}
+                photo_ids = [int(x) for x in cfg.get("photo_ids", [])]
+                if not photo_ids:
+                    photo_ids = [photo_id for photo_id, _ in photos]
+                photo_ids = [photo_id for photo_id in photo_ids if photo_id in photo_map]
+                if len(photo_ids) < 2:
+                    cfg["enabled"] = False
+                    cfg["photo_ids"] = photo_ids
+                    save_json(USERS_FILE, users_db)
+                    await _notify_random_profile_issue(
+                        uid, "⚠️ چرخش عکس پروفایل خاموش شد؛ برای ادامه حداقل ۲ عکس در گالری لازم است.")
+                    break
+                cfg["photo_ids"] = photo_ids
+                index = int(cfg.get("next_index", 0) or 0) % len(photo_ids)
+                photo_id = photo_ids[index]
+                await client(UpdateProfilePhotoRequest(id=_as_input_profile_photo(photo_map[photo_id])))
+                cfg["next_index"] = (index + 1) % len(photo_ids)
+                cfg["last_applied_photo_id"] = photo_id
+                cfg["last_error_notice"] = 0
+                save_json(USERS_FILE, users_db)
+            except asyncio.CancelledError:
+                raise
+            except FloodWaitError as e:
+                wait_seconds = max(1, int(getattr(e, "seconds", 1) or 1))
+                log_error(f"random profile FloodWait {uid}: {wait_seconds}s")
+                await _notify_random_profile_issue(
+                    uid, f"⚠️ تلگرام برای تغییر عکس {wait_seconds} ثانیه مکث خواست.")
+                await asyncio.sleep(wait_seconds)
+                continue
+            except Exception as e:
+                log_error(f"random profile {uid}: {_translate_bot_errors(e)}")
+                await _notify_random_profile_issue(
+                    uid, f"⚠️ تغییر عکس پروفایل انجام نشد: {_translate_bot_errors(e)}")
+            started = time.monotonic()
+            while get_random_profile_config(uid).get("enabled"):
+                interval = int(get_random_profile_config(uid).get("interval", 60) or 60)
+                if interval not in (60, 300, 600):
+                    interval = 60
+                remaining = interval - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1, remaining))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log_error(f"random_profile_loop {uid}: {_translate_bot_errors(e)}")
+    finally:
+        if random_profile_tasks.get(uid) is task:
+            random_profile_tasks.pop(uid, None)
+
+
+def start_random_profile_task(uid):
+    uid = int(uid)
+    task = random_profile_tasks.get(uid)
+    if task and not task.done():
+        return False
+    random_profile_tasks[uid] = asyncio.create_task(random_profile_loop(uid))
+    return True
+
+
+def stop_random_profile_task(uid):
+    task = random_profile_tasks.pop(int(uid), None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _pm_build_random_profile_panel(uid):
+    cfg = get_random_profile_config(uid)
+    count = len(cfg.get("photo_ids", []))
+    if not cfg.get("enabled"):
+        try:
+            _client, photos = await _load_own_profile_photos(uid)
+            cfg["photo_ids"] = [photo_id for photo_id, _ in photos]
+            count = len(cfg["photo_ids"])
+            save_json(USERS_FILE, users_db)
+        except Exception:
+            count = len(cfg.get("photo_ids", []))
+    interval = int(cfg.get("interval", 60) or 60)
+    labels = {60: "۱ دقیقه", 300: "۵ دقیقه", 600: "۱۰ دقیقه"}
+    if interval not in labels:
+        interval = 60
+        cfg["interval"] = interval
+    count_label = str(count) if count else "قابل‌خواندن نیست"
+    text = (
+        "📷 <b>پروفایل رندوم</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"وضعیت: {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}\n"
+        f"عکس‌های گالری پروفایل: {count_label}\n"
+        f"بازه: هر {labels[interval]}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "عکس‌های موجود در گالری پروفایل را به‌ترتیب جدیدترین تا قدیمی‌ترین، یکی‌یکی «اصلی» می‌کند؛ سپس از اول تکرار می‌شود.\n"
+        "برای روشن‌کردن حداقل ۲ عکس لازم است. فهرست هنگام روشن‌شدن ثبت می‌شود؛ برای افزودن عکس‌های جدید خاموش و دوباره روشن کن.\n"
+        f"دستورها: <code>{CMD}پروفایل رندوم روشن</code> · <code>{CMD}پروفایل رندوم خاموش</code>"
+    )
+    kb = [[_cb("🔴 خاموش کن" if cfg.get("enabled") else "🟢 روشن کن", "pn_random_profile_toggle")]]
+    kb.append([
+        _cb(f"{'✅ ' if interval == 60 else '⏱ '}۱ دقیقه", "pn_random_profile_iv_60"),
+        _cb(f"{'✅ ' if interval == 300 else '⏱ '}۵ دقیقه", "pn_random_profile_iv_300"),
+        _cb(f"{'✅ ' if interval == 600 else '⏱ '}۱۰ دقیقه", "pn_random_profile_iv_600"),
+    ])
+    kb.extend([
+        [_cb("🔄 بازخوانی پنل", "pn_random_profile_panel")],
+        [_cb("⚪ 🔙 بازگشت", "pn_tools")],
+    ])
+    return text, kb
+
+
 async def _pm_build_tools(uid):
     u = users_db["users"].get(str(uid), {})
     html_on = u.get("html_style_on", False)
@@ -9150,12 +10491,21 @@ async def _pm_build_tools(uid):
     html_cur = HTML_STYLES.get(u.get("html_style", "bold"), HTML_STYLES["bold"])["label"]
     font_cur = ENGLISH_FONTS.get(u.get("font", "none"), ENGLISH_FONTS["none"])["label"]
     allowed = is_media_allowed(uid)
+    name_emoji_on = get_name_emoji_config(uid).get("enabled", False)
+    monitor_on = monitor_db.get(str(int(uid)), {}).get("enabled", False)
+    random_profile_on = get_random_profile_config(uid).get("enabled", False)
     active_list = []
     if html_on: active_list.append(f"🎨 ({html_cur})")
     if font_on: active_list.append(f"🔤 ({font_cur})")
+    if name_emoji_on: active_list.append("😀 ایموجی اسم")
+    if monitor_on: active_list.append("👁 پایش پروفایل")
+    if random_profile_on: active_list.append("📷 پروفایل رندوم")
     off_list = []
     if not html_on: off_list.append("🎨")
-    if not font_on: off_list.append("🔤")
+    if not font_on: off_list.append("🔤 فونت")
+    if not name_emoji_on: off_list.append("😀 ایموجی اسم")
+    if not monitor_on: off_list.append("👁 پایش پروفایل")
+    if not random_profile_on: off_list.append("📷 پروفایل رندوم")
     if allowed:
         tcfg = get_ttl_config(uid)
         if tcfg.get("enabled"): active_list.append("🔥 TTL")
@@ -9167,13 +10517,55 @@ async def _pm_build_tools(uid):
         f"🟢 فعال: {active_str}\n🔴 خاموش: {off_str}\n"
         "━━━━━━━━━━━━━━━━━"
     )
-    kb = [
-        [_cb("🎨 استایل HTML", "pn_html_panel"), _cb("🔤 فونت", "pn_font_panel")],
-    ]
+    kb = [[_cb("🎨 استایل HTML", "pn_html_panel"), _cb("🔤 فونت", "pn_font_panel")]]
     if allowed:
         kb.append([_cb("🔥 TTL", "pn_ttl_panel"), _cb("📥 ذخیره", "pn_save_panel")])
-    kb.append([_cb("⚪ 🔙 بازگشت", "pn_refresh")])
+    kb.extend([
+        [_cb("🔊 تبدیل متن و ویس", "pn_tts_panel"), _cb("👁 پایش پروفایل", "pn_mon_main")],
+        [_cb("😀 ایموجی اسم", "pn_name_emoji_panel"),
+         _cb("📷 پروفایل رندوم", "pn_random_profile_panel")],
+        [_cb("⚪ 🔙 بازگشت", "pn_refresh")],
+    ])
     return text, kb
+
+async def _pm_build_name_emoji_panel(uid):
+    cfg = get_name_emoji_config(uid)
+    selected = list(dict.fromkeys(cfg.get("emojis", [])))
+    custom = list(dict.fromkeys(cfg.get("custom_emojis", [])))
+    all_emojis = list(dict.fromkeys(NAME_EMOJI_PRESETS + custom))
+    position = cfg.get("position", "start")
+    interval = int(cfg.get("interval", 60) or 60)
+    interval_label = {60: "۱ دقیقه", 300: "۵ دقیقه", 600: "۱۰ دقیقه"}.get(interval, f"{interval} ثانیه")
+    text = (
+        "😀 <b>پنل ایموجی اسم</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📊 وضعیت: {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}\n"
+        f"📍 موقعیت: {'ابتدای اسم' if position == 'start' else 'انتهای اسم'}\n"
+        f"⏱ زمان‌بندی: هر {interval_label}\n"
+        f"✨ ایموجی‌های انتخاب‌شده: {' '.join(html_lib.escape(x) for x in selected) if selected else '—'}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "ایموجی‌ها به نام پروفایل تلگرامت اضافه می‌شوند و می‌چرخند."
+    )
+    kb = [[_cb("🔴 خاموش کن" if cfg.get("enabled") else "🟢 روشن کن", "pn_name_emoji_toggle")]]
+    kb.append([
+        _cb(f"{'✅ ' if position == 'start' else ''}📍 ابتدا", "pn_emoji_pos_start"),
+        _cb(f"{'✅ ' if position == 'end' else ''}📍 انتها", "pn_emoji_pos_end"),
+    ])
+    kb.append([
+        _cb(f"{'✅ ' if interval == 60 else '⏱ '}۱ دقیقه", "pn_emoji_iv_60"),
+        _cb(f"{'✅ ' if interval == 300 else '⏱ '}۵ دقیقه", "pn_emoji_iv_300"),
+        _cb(f"{'✅ ' if interval == 600 else '⏱ '}۱۰ دقیقه", "pn_emoji_iv_600"),
+    ])
+    for i in range(0, len(all_emojis), 4):
+        row = []
+        for emoji in all_emojis[i:i+4]:
+            mark = "✅" if emoji in selected else "▫️"
+            row.append(_cb(f"{mark} {emoji}", f"pn_name_emoji_pick_{all_emojis.index(emoji)}"))
+        kb.append(row)
+    kb.append([_cb("➕ افزودن ایموجی دلخواه", "pn_name_emoji_add")])
+    kb.append([_cb("⚪ 🔙 بازگشت", "pn_tools")])
+    return text, kb
+
 
 async def _pm_build_html_panel(uid):
     u = users_db["users"].get(str(uid), {})
@@ -9186,7 +10578,7 @@ async def _pm_build_html_panel(uid):
         f"💡 هر استایل با خودش نمایش داده شده"
     )
     kb = [[_cb(f"{'🔴 خاموش کن' if on else '🟢 روشن کن'}", "pn_html_toggle")]]
-    items = list(HTML_STYLES.items())
+    items = [(k, v) for k, v in HTML_STYLES.items() if k not in ("none", "pre")]
     for i in range(0, len(items), 2):
         row = []
         for j in range(2):
@@ -9224,6 +10616,8 @@ async def _pm_build_font_panel(uid):
     return text, kb
 
 async def _pm_build_ttl_panel(uid):
+    if not is_media_allowed(uid):
+        return ("🔒 این بخش در دسترس نیست.", [[_cb("⚪ 🔙 بازگشت", "pn_tools")]])
     cfg = get_ttl_config(uid)
     on = cfg["enabled"]
     target = cfg["target"]
@@ -9246,6 +10640,8 @@ async def _pm_build_ttl_panel(uid):
     return text, kb
 
 async def _pm_build_save_panel(uid):
+    if not is_media_allowed(uid):
+        return ("🔒 این بخش در دسترس نیست.", [[_cb("⚪ 🔙 بازگشت", "pn_tools")]])
     text = (
         "📥 ذخیره رسانه\n"
         "━━━━━━━━━━━━━━━━━\n"
@@ -9255,6 +10651,9 @@ async def _pm_build_save_panel(uid):
         "2️⃣ لینک تلگرامی بفرست:\n"
         f"   <code>{CMD}ذخیره https://t.me/c/xxx/123</code>\n"
         f"   <code>{CMD}ذخیره https://t.me/username/456</code>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "📝 اگر رسانه کپشن/نوشته داشته باشه، همون متن همراهش ذخیره می‌شه.\n"
+        "🖼 اگر پیام آلبوم چندرسانه‌ای باشه، همهٔ رسانه‌های آلبوم ذخیره می‌شن.\n"
         "━━━━━━━━━━━━━━━━━\n"
         "🎯 رسانه ذخیره می‌شه تو:\n"
         "   <b>پیام‌های ذخیره شده (Saved Messages)</b>"
@@ -9284,30 +10683,176 @@ async def _pm_build_media_access_panel(uid):
             lines.append(f"   🆔 <code>{u}</code>")
             lines.append(f"   <code>،لغو اجازه {u}</code>")
     kb = [
+        [_cb("➕ افزودن دسترسی ویژه", "pn_media_grant_list_0")],
+        [_cb("🗑 حذف از لیست ویژه", "pn_media_remove_list_0")],
         [_cb("🔄 بروزرسانی", "pn_media_panel")],
         [_cb("⚪ 🔙 بازگشت", "pn_owner")],
     ]
     return "\n".join(lines), kb
 
 
+def _get_media_grant_candidates():
+    """اعضای ربات که هنوز دسترسی ویژه (TTL/ذخیره) ندارند."""
+    candidates = []
+    for raw_uid, info in users_db.get("users", {}).items():
+        try: target = int(raw_uid)
+        except (TypeError, ValueError): continue
+        if is_grp_owner(target) or info.get("media_allowed", False): continue
+        if info.get("banned"):
+            icon = "🚫"
+        elif info.get("active"):
+            icon = "🟢"
+        else:
+            icon = "🔴"
+        candidates.append((target, str(info.get("name") or target), icon))
+    candidates.sort(key=lambda item: (item[2], item[1].casefold()))
+    return candidates
+
+
+async def _pm_build_media_grant_list(uid, page=0, notice=None):
+    if not is_grp_owner(uid):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    candidates = _get_media_grant_candidates()
+    per_page = 15
+    page_count = max(1, (len(candidates) + per_page - 1) // per_page)
+    page = max(0, min(int(page), page_count - 1))
+    start = page * per_page
+    shown = candidates[start:start + per_page]
+    lines = ["➕ افزودن دسترسی ویژه", "━━━━━━━━━━━━━━━━━"]
+    if notice:
+        lines.extend([notice, ""])
+    if not candidates:
+        lines.append("📭 کاربری بدون دسترسی برای افزودن پیدا نشد.")
+    else:
+        lines.append(f"📊 {len(candidates)} عضو بدون دسترسی ویژه")
+        lines.append(f"👇 روی دکمهٔ هر عضو بزنید تا تأیید بگیرید. ({page + 1}/{page_count})")
+    kb = []
+    for target, name, icon in shown:
+        label = " ".join(name.split())[:24] or str(target)
+        kb.append([_cb(f"{icon} {label} · {target}", f"pn_media_grant_pick_{target}_{page}")])
+    if page_count > 1:
+        nav = []
+        if page > 0: nav.append(_cb("⬅️ قبلی", f"pn_media_grant_list_{page - 1}"))
+        if page + 1 < page_count: nav.append(_cb("بعدی ➡️", f"pn_media_grant_list_{page + 1}"))
+        if nav: kb.append(nav)
+    kb.extend([
+        [_cb("🔙 بازگشت به دسترسی‌های ویژه", "pn_media_panel")],
+        [_cb("⚪ بازگشت به پنل مالک", "pn_owner")],
+    ])
+    return "\n".join(lines), kb
+
+
+async def _pm_build_media_grant_confirm(uid, target, page=0):
+    if not is_grp_owner(uid):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    target = int(target)
+    info = users_db.get("users", {}).get(str(target))
+    if not info or is_grp_owner(target) or is_media_allowed(target):
+        return await _pm_build_media_grant_list(
+            uid, page, "ℹ️ این کاربر دیگر برای افزودن در دسترس نیست."
+        )
+    name = html_lib.escape(" ".join(str(info.get("name") or target).split()))
+    text = (
+        "⚠️ تأیید افزودن دسترسی ویژه\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"کاربر: {name}\n🆔 <code>{target}</code>\n\n"
+        "آیا دسترسی TTL/ذخیره به این کاربر داده شود؟"
+    )
+    kb = [[_cb("✅ بله، اضافه کن", f"pn_media_grant_yes_{target}_{page}"),
+           _cb("❌ خیر", f"pn_media_grant_no_{page}")]]
+    return text, kb
+
+
+async def _pm_build_media_remove_list(uid, page=0, notice=None):
+    if not is_grp_owner(uid):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    users = [u for u in get_media_allowed_users() if not is_grp_owner(u)]
+    per_page = 15
+    page_count = max(1, (len(users) + per_page - 1) // per_page)
+    page = max(0, min(int(page), page_count - 1))
+    start = page * per_page
+    shown = users[start:start + per_page]
+    lines = ["🗑 حذف دسترسی ویژه", "━━━━━━━━━━━━━━━━━"]
+    if notice:
+        lines.extend([notice, ""])
+    if not users:
+        lines.append("📭 کاربری در فهرست دسترسی ویژه نیست.")
+    else:
+        lines.append(f"برای انتخاب کاربر روی دکمهٔ نامش بزنید. ({page + 1}/{page_count})")
+    kb = []
+    cl = user_clients.get(int(uid))
+    for target in shown:
+        try:
+            name = await get_plain_name(cl, target) if cl else str(target)
+        except Exception:
+            name = str(target)
+        name = " ".join(str(name).split())[:24] or str(target)
+        kb.append([_cb(f"👤 {name} · {target}", f"pn_media_remove_pick_{target}_{page}")])
+    if page_count > 1:
+        nav = []
+        if page > 0:
+            nav.append(_cb("⬅️ قبلی", f"pn_media_remove_list_{page - 1}"))
+        if page + 1 < page_count:
+            nav.append(_cb("بعدی ➡️", f"pn_media_remove_list_{page + 1}"))
+        if nav:
+            kb.append(nav)
+    kb.extend([
+        [_cb("🔙 بازگشت به دسترسی‌های ویژه", "pn_media_panel")],
+        [_cb("⚪ بازگشت به پنل مالک", "pn_owner")],
+    ])
+    return "\n".join(lines), kb
+
+
+async def _pm_build_media_remove_confirm(uid, target, page=0):
+    if not is_grp_owner(uid):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    target = int(target)
+    if is_grp_owner(target) or not is_media_allowed(target):
+        return await _pm_build_media_remove_list(
+            uid, page, "ℹ️ این کاربر دیگر در فهرست افراد مجاز نیست."
+        )
+    cl = user_clients.get(int(uid))
+    try:
+        name = await get_plain_name(cl, target) if cl else str(target)
+    except Exception:
+        name = str(target)
+    safe_name = html_lib.escape(" ".join(str(name).split()))
+    text = (
+        "⚠️ تأیید حذف دسترسی ویژه\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"کاربر: {safe_name}\n🆔 <code>{target}</code>\n\n"
+        "آیا دسترسی TTL/ذخیرهٔ این کاربر حذف شود؟"
+    )
+    kb = [
+        [_cb("✅ بله، حذف کن", f"pn_media_remove_yes_{target}_{page}"),
+         _cb("❌ خیر", f"pn_media_remove_no_{page}")],
+    ]
+    return text, kb
+
 
 async def _pm_build_notif_panel(uid):
-    notifs = users_db["users"].get(str(uid), {}).get("notifications", {})
+    notifs = get_user_notifs(uid)
     mat_on = notifs.get("mat_trans", True)
     item_on = notifs.get("item_trans", True)
     sell_on = notifs.get("sell", True)
+    monitor_on = notifs.get("monitor", True)
+    emoji_on = notifs.get("emoji_name", True)
     
     text = (
         "🔔 <b>مدیریت اعلان‌ها</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "با زدن روی هر دکمه، وضعیت اون اعلان تغییر می‌کنه.\n"
-        "🟢 = روشن (پیام میاد)\n"
-        "🔴 = خاموش (پیام نمیاد)\n"
+        "این دکمه‌ها فقط اعلان‌های پی‌وی را کنترل می‌کنند، نه خود عملیات را.\n"
+        "📦 انتقال مواد / 🎁 انتقال کالا: اعلانِ ناموفق‌بودن انتقال پیش از فروش\n"
+        "💰 گزارش فروش: پیام‌های وضعیت فروش\n"
+        "👁 پایش و 😀 ایموجی اسم: اعلان‌های مربوط به این قابلیت‌ها\n"
+        "🟢 = اعلان روشن  ·  🔴 = اعلان خاموش\n"
     )
     kb = [
         [_cb(f"{'🟢' if mat_on else '🔴'} انتقال مواد", "pn_notif_toggle_mat")],
         [_cb(f"{'🟢' if item_on else '🔴'} انتقال کالا", "pn_notif_toggle_item")],
         [_cb(f"{'🟢' if sell_on else '🔴'} گزارش فروش", "pn_notif_toggle_sell")],
+        [_cb(f"{'🟢' if monitor_on else '🔴'} پایش پروفایل", "pn_notif_toggle_mon")],
+        [_cb(f"{'🟢' if emoji_on else '🔴'} ایموجی اسم", "pn_notif_toggle_emoji")],
         [_cb("⚪ 🔙 بازگشت", "pn_settings")],
     ]
     return text, kb
@@ -9485,8 +11030,61 @@ async def _pm_build_pony_pick(uid, page=0):
     if page > 0: nav.append(_cb("⬅️ قبلی", f"pn_pony_pg_{page-1}"))
     if page < total_pages - 1: nav.append(_cb("بعدی ➡️", f"pn_pony_pg_{page+1}"))
     if nav: kb.append(nav)
-    kb.append([_cb("⚪ 🔙 بازگشت", "pn_games")])
+    kb.append([_cb("⚪ 🔙 بازگشت", "pn_pony_main")])
     return "\n".join(lines), kb
+
+async def _pm_build_pony_main(uid):
+    """Pony section entry point; keep users in the section before group selection."""
+    cid = pm_panel_chat.get(int(uid))
+    if cid is None:
+        text = (
+            "🐴 پنل پونی و دانجن\n━━━━━━━━━━━━━━━━━\n"
+            "هنوز گروهی انتخاب نشده.\n"
+            "از دکمهٔ «تغییر گروه» یک گروه انتخاب کن.")
+        kb = [
+            [_cb("🔀 انتخاب / تغییر گروه", "pn_pony_pick")],
+            [_cb("⚪ 🔙 بازگشت", "pn_games")],
+        ]
+        return text, kb
+    return await _pm_build_pony_panel(uid, int(cid))
+
+
+async def _pm_build_pony_ctrl(uid, cid):
+    key = (int(uid), int(cid))
+    cfg = pony_config.get(key, {"collect": False, "upgrade": False})
+    is_on = bool(cfg.get("collect", False))
+    interval = int(cfg.get("interval_mins", 15) or 15)
+    interval_labels = {5: "۵", 10: "۱۰", 15: "۱۵", 20: "۲۰"}
+    interval_label = interval_labels.get(interval, str(interval))
+    title = str(cid)
+    try:
+        client = user_clients.get(int(uid))
+        if client:
+            ent = await client.get_entity(cid)
+            title = getattr(ent, "title", None) or title
+    except: pass
+    title = html_lib.escape(str(title))
+    text = (
+        "🐴 تنظیمات پونی\n"
+        f"📍 گروه انتخاب‌شده: <b>{title[:50]}</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"وضعیت: {'🟢 روشن' if is_on else '🔴 خاموش'}\n"
+        f"⏱ بازهٔ ارسال: {interval_label} دقیقه\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "بازهٔ انتخابی، فاصلهٔ اجرای خودکار پونی است."
+    )
+    def interval_button(minutes):
+        label = interval_labels[minutes]
+        mark = "✅ " if interval == minutes else "⏱ "
+        return _cb(f"{mark}{label} دقیقه", f"pn_pony_interval_{cid}_{minutes}")
+    kb = [
+        [_cb("🔴 خاموش کن" if is_on else "🟢 روشن کن", f"pn_pony_t_{cid}")],
+        [interval_button(5), interval_button(10)],
+        [interval_button(15), interval_button(20)],
+        [_cb("⚪ 🔙 بازگشت", f"pn_pony_sel_{cid}")],
+    ]
+    return text, kb
+
 
 async def _pm_build_pony_panel(uid, cid):
     cfg = pony_config.get((int(uid), int(cid)), {"collect": False, "upgrade": False})
@@ -9502,20 +11100,60 @@ async def _pm_build_pony_panel(uid, cid):
             ent = await c.get_entity(cid)
             title = getattr(ent, 'title', None) or title
     except: pass
+    title = html_lib.escape(str(title))
     lines = [
-        f"🐴 پونی — {title[:30]}",
+        "🐴 پنل پونی و دانجن",
+        f"📍 گروه انتخاب‌شده: <b>{title[:50]}</b>",
         f"پونی: {'🟢' if p_on else '🔴'}",
         f"ارتقا: {'🟢' if u_on else '🔴'}",
         f"دانجن: {'🟢' if d_on else '🔴'} · {d_work}",
+        f"ناز خودکار: {'🟢 روشن' if cfg.get('naz_enabled') else '🔴 خاموش'} · "
+        f"{int(cfg.get('naz_interval_mins', 3) or 3)} دقیقه و ۱۰ ثانیه",
     ]
     kb = [
-        [_cb(f"{'🔴' if p_on else '🟢'} پونی", f"pn_pony_t_{cid}")],
+        [_cb("🐴 پونی", f"pn_pony_ctrl_{cid}")],
         [_cb(f"{'🔴' if u_on else '🟢'} ارتقا", f"pn_up_t_{cid}")],
         [_cb("🔵 🏰 دانجن", f"pn_dgn_panel_{cid}")],
         [_cb("🔵 🔀 گروه", "pn_pony_pick")],
+        [_cb("💞 ناز خودکار", f"pn_pony_naz_panel_{cid}")],
         [_cb("⚪ 🔙 بازگشت", "pn_games")],
     ]
     return "\n".join(lines), kb
+
+async def _pm_build_naz_auto_panel(uid, cid):
+    cfg = pony_config.get((int(uid), int(cid)), {})
+    enabled = bool(cfg.get("naz_enabled", False))
+    interval = int(cfg.get("naz_interval_mins", 3) or 3)
+    if interval not in (3, 5):
+        interval = 3
+    title = str(cid)
+    try:
+        client = user_clients.get(int(uid))
+        if client:
+            entity = await client.get_entity(cid)
+            title = getattr(entity, "title", None) or title
+    except: pass
+    title = html_lib.escape(str(title))
+    interval_label = "۳" if interval == 3 else "۵"
+    text = (
+        "💞 <b>ناز خودکار</b>\n"
+        f"📍 گروه: <b>{title[:50]}</b>\n"
+        f"وضعیت: {'🟢 روشن' if enabled else '🔴 خاموش'}\n"
+        f"⏱ بازهٔ انتخاب‌شده: هر {interval_label} دقیقه و ۱۰ ثانیه\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "در حالت روشن، پیام «ناز» در همین گروه ارسال می‌شود."
+    )
+    def interval_button(minutes):
+        label = "۳" if minutes == 3 else "۵"
+        mark = "✅ " if interval == minutes else "⏱ "
+        return _cb(f"{mark}{label} دقیقه و ۱۰ ثانیه", f"pn_pony_naz_interval_{cid}_{minutes}")
+    kb = [
+        [_cb("🔴 خاموش کن" if enabled else "🟢 روشن کن", f"pn_pony_naz_toggle_{cid}")],
+        [interval_button(3), interval_button(5)],
+        [_cb("⚪ 🔙 بازگشت", f"pn_pony_sel_{cid}")],
+    ]
+    return text, kb
+
 
 async def _pm_build_dungeon_panel(uid, cid):
     dcfg = dungeon_config.get((int(uid), int(cid)),
@@ -9553,7 +11191,7 @@ async def _pm_build_dungeon_panel(uid, cid):
             if row: kb.append(row)
     else:
         kb.append([_cb("🔵 🔄 ریست", f"pn_dgn_test_{cid}")])
-    kb.append([_cb("⚪ 🔙 بازگشت", "pn_pony_pick")])
+    kb.append([_cb("⚪ 🔙 بازگشت", f"pn_pony_sel_{cid}")])
     return "\n".join(lines), kb
 
 async def _pm_build_transfer(uid):
@@ -9565,7 +11203,7 @@ async def _pm_build_transfer(uid):
         f"👤 گیرنده: {cfg.get('c_id', '—')}",
         f"💰 مبلغ: {cfg.get('desired', 0):,}" if cfg.get('desired') else "💰 مبلغ: —",
         "",
-        f"{CMD}انتقال تنظیم <C_ID> <مبلغ>",
+        f"{CMD}انتقال تنظیم &lt;C_ID&gt; &lt;مبلغ&gt;",
     ]
     kb = [
         [_cb("🟢 روشن" if not on else "🔴 خاموش", "pn_transfer_toggle")],
@@ -9816,7 +11454,7 @@ async def _pm_build_interval_slider(uid, bname, mode="edit"):
 async def _pm_build_banner_view(uid, bname):
     banners = get_user_banners(uid)
     if bname not in banners:
-        return f"❌ بنر پیدا نشد.", [[_cb("⚪ 🔙 بازگشت", "pn_banner_main")]]
+        return "❌ بنر پیدا نشد.", [[_cb("⚪ 🔙 بازگشت", "pn_banner_main")]]
     b = banners[bname]
     targets = b.get("targets", [])
     t_lines = []
@@ -9944,6 +11582,144 @@ async def _pm_build_users_full(uid, page=0):
     kb.append([_cb("🔵 🔄", f"pn_users_{page}"), _cb("⚪ 🔙 بازگشت", "pn_refresh")])
     return "\n".join(lines), kb
 
+def _pm_wrap_access_proxy_result(owner_id, target, result, notice=None, current_raw=None):
+    """پنل کاربر را با دکمه‌های «پروکسی» + کنترل قفل همان بخش برمی‌گرداند."""
+    file_path = None
+    if isinstance(result, tuple) and len(result) == 3:
+        text, kb, file_path = result
+    elif isinstance(result, tuple) and len(result) == 2:
+        text, kb = result
+    else:
+        return result
+    if notice:
+        text = f"{notice}\n━━━━━━━━━━━━━━━━━\n{text}"
+    target = int(target)
+    target_locks = get_locked_sections(target)
+    wrapped = []
+    for row in kb or []:
+        new_row = []
+        for button in row:
+            raw = getattr(button, "data", b"")
+            if isinstance(raw, bytes): raw = raw.decode(errors="ignore")
+            raw = str(raw or "")
+            if not raw:
+                new_row.append(button)
+                continue
+            if raw in ("pn_owner", "pn_close"):
+                continue
+            label = button.text
+            if raw in target_locks:
+                label = f"🔒 {label}"
+            new_row.append(_cb(label, f"pn_access_as_{target}_{raw}"))
+        if new_row: wrapped.append(new_row)
+    current_raw = str(current_raw or "")
+    if _is_lockable_panel(current_raw):
+        is_locked = current_raw in target_locks
+        sec_label = _panel_lock_label(current_raw, text)
+        wrapped.append([_cb(
+            f"🔓 بازکردن «{sec_label}»" if is_locked else f"🔒 قفل «{sec_label}»",
+            f"pn_access_seclk_{target}_{current_raw}")])
+        wrapped.append([_cb("🧩 قفل/بازکردن دکمه‌های همین صفحه",
+                            f"pn_access_items_{target}_{current_raw}")])
+    if current_raw in ("", "pn_refresh", "pn_owner"):
+        locked_all = bool(users_db.get("users", {}).get(str(target), {}).get("all_access_locked", False))
+        lock_count = len(target_locks)
+        wrapped.append([_cb(
+            f"📋 قفل‌های بخش‌ها ({lock_count})" if lock_count else "📋 قفل‌های بخش‌ها",
+            f"pn_access_locks_{target}")])
+        wrapped.append([_cb("🔓 بازکردن همهٔ دسترسی‌ها" if locked_all else "🔒 قفل همهٔ دسترسی‌ها",
+                            f"pn_access_lock_{target}")])
+    wrapped.append([_cb("↩️ خروج از دسترسی کاربر", f"pn_access_exit_{target}")])
+    return (text, wrapped, file_path) if file_path else (text, wrapped)
+
+
+async def _access_panel_items(event, target, panel_raw):
+    """دکمه‌های یک صفحهٔ پنل کاربر را برای قفل‌کردن تک‌تک برمی‌گرداند."""
+    panel_raw = str(panel_raw or "")
+    try:
+        result = await _dispatch_pn_core(event, int(target), panel_raw, actor_id=OWNER_ID)
+    except Exception as e:
+        log_error(f"_access_panel_items {target}/{panel_raw}: {_translate_bot_errors(e)}")
+        return "", []
+    text, kb = "", []
+    if isinstance(result, tuple) and len(result) >= 2:
+        text, kb = result[0], result[1]
+    items, seen = [], set()
+    for row in kb or []:
+        for button in row:
+            raw = getattr(button, "data", None)
+            if isinstance(raw, bytes): raw = raw.decode(errors="ignore")
+            raw = str(raw or "")
+            if not raw or raw in _SECTION_LOCK_IGNORE or raw.startswith("pn_access_"):
+                continue
+            if raw in seen:
+                continue
+            seen.add(raw)
+            label = re.sub(r"\s+", " ", str(getattr(button, "text", "") or raw)).strip()[:30] or raw
+            items.append((raw, label))
+    return text, items
+
+
+async def _pm_build_access_item_menu(event, owner_id, target, panel_raw, notice=None):
+    if not is_grp_owner(owner_id):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    target = int(target)
+    panel_raw = str(panel_raw or "")
+    panel_text, items = await _access_panel_items(event, target, panel_raw)
+    locks = get_locked_sections(target)
+    lines = ["🧩 قفل دکمه‌های این صفحه", "━━━━━━━━━━━━━━━━━",
+             f"🗂 بخش: {_panel_lock_label(panel_raw, panel_text)}"]
+    if notice:
+        lines.extend(["", notice])
+    lines.append("")
+    if not items:
+        lines.append("📭 دکمه‌ای برای قفل کردن در این صفحه نیست.")
+    else:
+        lines.append("👇 روی هر دکمه بزن تا 🔒/🟢 عوض شود.")
+        lines.append("دکمه‌های 🔒 برای کاربر مخفی می‌شوند و کار نمی‌کنند.")
+    kb = []
+    if locks:
+        kb.append([_cb(f"📋 قفل‌های فعال ({len(locks)})", f"pn_access_locks_{target}")])
+    for idx, (raw, label) in enumerate(items):
+        icon = "🔒" if raw in locks else "🟢"
+        kb.append([_cb(f"{icon} {label}", f"pn_access_item_{target}_{idx}_{panel_raw}")])
+    kb.append([_cb("⚪ 🔙 بازگشت به همان صفحه", f"pn_access_as_{target}_{panel_raw}")])
+    return "\n".join(lines), kb
+
+
+async def _pm_build_access_locks(owner_id, target, notice=None):
+    if not is_grp_owner(owner_id):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    target = int(target)
+    locks = get_locked_sections(target)
+    lines = ["📋 قفل‌های بخش‌ها", "━━━━━━━━━━━━━━━━━"]
+    if notice:
+        lines.extend(["", notice])
+    if not locks:
+        lines.append("📭 هیچ بخشی برای این کاربر قفل نیست.")
+    else:
+        lines.append(f"🔒 {len(locks)} مورد قفل است و در پنل کاربر دیده نمی‌شود:")
+        lines.append("")
+    kb = []
+    for key, label in sorted(locks.items(), key=lambda kv: kv[1]):
+        kb.append([_cb(f"🔓 بازکردن: {label[:26]}", f"pn_access_unlk_{target}_{key}")])
+    if len(locks) > 1:
+        kb.append([_cb("🔓 بازکردن همهٔ قفل‌های بخش‌ها", f"pn_access_unlockall_{target}")])
+    kb.append([_cb("⚪ 🔙 بازگشت به پنل کاربر", f"pn_access_as_{target}_pn_refresh")])
+    return "\n".join(lines), kb
+
+
+async def _pm_build_access_editor(owner_id, target, notice=None):
+    if not is_grp_owner(owner_id):
+        return ("🔒 فقط مالک", [[_cb("⚪ 🔙", "pn_owner")]])
+    info = users_db.get("users", {}).get(str(target), {})
+    if not info:
+        return await _pm_build_user(owner_id, target)
+    text, kb = await _pm_build_main(int(target))
+    return _pm_wrap_access_proxy_result(owner_id, int(target), (text, kb), notice,
+                                        current_raw="pn_refresh")
+
+
 async def _pm_build_user(uid, target):
     info = users_db["users"].get(str(target), {})
     if not info: return "❌ نیست.", [[_cb("⚪ 🔙 بازگشت", "pn_users_0")]]
@@ -9956,14 +11732,20 @@ async def _pm_build_user(uid, target):
     g_label = "🩷" if g == "girl" else ("💙" if g == "boy" else "❓")
     media_allowed = is_media_allowed(target)
     media_lbl = "🟢 داره" if media_allowed else "🔴 نداره"
+    all_access_locked = bool(info.get("all_access_locked", False))
     lines = [
-        f"👤 کاربر", f"📛 {info.get('name', '—')}",
+        "👤 کاربر", f"📛 {info.get('name', '—')}",
         f"🆔 {target}", f"📱 {info.get('phone', '—')}",
         f"⚧ {g_label}", f"📊 {st}",
         f"👮 {'✅' if is_mgr else '❌'}",
         f"🔐 TTL/ذخیره: {media_lbl}",
+        f"🛡 قفل همهٔ دسترسی‌ها: {'🔒 فعال' if all_access_locked else '🔓 غیرفعال'}",
+        f"🔐 بخش‌های قفل‌شده: {len(get_locked_sections(target))}",
     ]
-    kb = []
+    kb = [[_cb("🛠 ویرایش دسترسی", f"pn_access_edit_{target}")]]
+    _locks_n = len(get_locked_sections(target))
+    kb.append([_cb(f"🛡 قفل بخش‌ها ({_locks_n})" if _locks_n else "🛡 قفل بخش‌ها",
+                   f"pn_access_locks_{target}")])
     if banned: kb.append([_cb("🟢 ✅ رفع بن", f"pn_unban_{target}")])
     else: kb.append([_cb("🔴 🚫 بن", f"pn_ban_{target}")])
     if is_mgr: kb.append([_cb("🔴 🗑 حذف مدیر", f"pn_rmmgr_{target}")])
@@ -9985,6 +11767,52 @@ def _pm_banner_cancel_kb():
 # ═══════════════════════════════════════════════════════
 # _pm_banner_state_input
 # ═══════════════════════════════════════════════════════
+def _banner_prompt_key(text):
+    text = re.sub(r"<[^>]*>", "", text or "")
+    return re.sub(r"\s+", " ", _normalize_persian(text)).strip()
+
+
+def _arm_banner_add_timeout(user_id, state, prompt_text=None, prompt_msg_id=None):
+    old = pm_banner_add_timeout_tasks.pop(user_id, None)
+    if old and not old.done(): old.cancel()
+    if prompt_msg_id is not None: state["prompt_msg_id"] = prompt_msg_id
+    if prompt_text is not None: state["prompt_text"] = prompt_text
+    token = f"{time.monotonic_ns()}-{random.getrandbits(32)}"
+    state["timeout_token"] = token
+    state["expires_at"] = time.time() + 300
+    pm_banner_states[user_id] = state
+    async def expire():
+        try:
+            await asyncio.sleep(300)
+            current = pm_banner_states.get(user_id)
+            if not current or current.get("timeout_token") != token:
+                return
+            if current.get("mode") not in ("add_name", "add_wait_media", "add_forward_wait"):
+                return
+            pm_banner_states.pop(user_id, None)
+            prompt_id = current.get("prompt_msg_id")
+            chat_id = current.get("prompt_chat_id")
+            timeout_text = "⏱ عملیات افزودن تبچی به‌دلیل عدم پاسخ در ۵ دقیقه لغو شد."
+            if prompt_id is not None and _is_inline_id(prompt_id):
+                await _try_inline_edit_global(prompt_id, timeout_text, [])
+            elif prompt_id is not None and chat_id is not None:
+                client = user_clients.get(int(user_id))
+                if client and client.is_connected():
+                    try: await client.edit_message(chat_id, prompt_id, timeout_text, buttons=None)
+                    except Exception as e: log_error(f"banner add timeout edit {user_id}: {_translate_bot_errors(e)}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log_error(f"banner add timeout {user_id}: {_translate_bot_errors(e)}")
+    pm_banner_add_timeout_tasks[user_id] = asyncio.create_task(expire())
+
+
+def _clear_banner_add_state(user_id):
+    task = pm_banner_add_timeout_tasks.pop(user_id, None)
+    if task and not task.done(): task.cancel()
+    pm_banner_states.pop(user_id, None)
+
+
 async def _pm_banner_state_input(event, user_id):
     st = pm_banner_states.get(user_id)
     if not st: return False
@@ -9996,23 +11824,108 @@ async def _pm_banner_state_input(event, user_id):
                 return False
         except Exception:
             return False
+    if mode in ("add_name", "add_wait_media", "add_forward_wait"):
+        if time.time() >= st.get("expires_at", time.time() + 300):
+            _clear_banner_add_state(user_id)
+            return True
+        try:
+            replied = await event.get_reply_message()
+        except Exception:
+            replied = None
+        if not replied:
+            return True
+        expected_id = st.get("prompt_msg_id")
+        is_same_prompt = False
+        if isinstance(expected_id, int):
+            is_same_prompt = (getattr(event, "reply_to_msg_id", None) == expected_id)
+        elif expected_id is not None:
+            # Inline message IDs are opaque; verify the exact helper-bot prompt text.
+            is_same_prompt = (
+                (bool(getattr(replied, "via_bot_id", None)) or bool(getattr(replied, "out", False)))
+                and _banner_prompt_key(replied.raw_text or "") ==
+                    _banner_prompt_key(st.get("prompt_text", ""))
+            )
+        if not is_same_prompt:
+            return True
     text = (event.raw_text or "").strip()
     try:
+        if mode == "tts_text_input":
+            if text.startswith(CMD):
+                pm_banner_states.pop(user_id, None)
+                return False
+            if not text:
+                await event.reply("❌ متن خالی است؛ متن را بفرست یا لغو کن.")
+                return True
+            gender = users_db["users"].get(str(user_id), {}).get("voice_gender", "female")
+            pm_banner_states.pop(user_id, None)
+            await _send_tts_voice(event, text, gender)
+            return True
+        if mode == "tts_voice_wait":
+            if text.startswith(CMD):
+                pm_banner_states.pop(user_id, None)
+                return False
+            message = getattr(event, "message", None)
+            if message and (getattr(message, "voice", None) or getattr(message, "audio", None)):
+                pm_banner_states.pop(user_id, None)
+                await _transcribe_voice_message(event, message)
+                return True
+            await event.reply("🎧 حالا یک ویس یا فایل صوتی بفرست؛ یا با دکمهٔ لغو برگرد.")
+            return True
+        if mode == "mon_add":
+            if text in (f"{CMD}لغو", f"{CMD}کنسل"):
+                pm_banner_states.pop(user_id, None)
+                await event.reply("✅ افزودن به پایش لغو شد.")
+                return True
+            monitor_arg = text
+            if text.startswith(f"{CMD}پایش افزودن"):
+                monitor_arg = text.replace(f"{CMD}پایش افزودن", "", 1).strip()
+            ok, result = await _monitor_add_target(user_id, event, monitor_arg)
+            pm_banner_states.pop(user_id, None)
+            await event.reply(result)
+            return True
+        if mode == "name_emoji_add":
+            if text.startswith(CMD):
+                pm_banner_states.pop(user_id, None)
+                return False
+            emoji = "".join((event.raw_text or "").split())
+            has_emoji_char = any(
+                ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF
+                for ch in emoji)
+            allowed_emoji_chars = all(
+                ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF
+                or ch in "\u200d\ufe0e\ufe0f\u20e3"
+                for ch in emoji)
+            if not emoji or len(emoji) > 16 or not has_emoji_char or not allowed_emoji_chars:
+                await event.reply("❌ فقط یک ایموجی بفرست.")
+                return True
+            cfg = get_name_emoji_config(user_id)
+            if emoji not in cfg["custom_emojis"]:
+                cfg["custom_emojis"].append(emoji)
+            if emoji not in cfg["emojis"]:
+                cfg["emojis"].append(emoji)
+            pm_banner_states.pop(user_id, None)
+            save_json(USERS_FILE, users_db)
+            await event.reply(f"✅ ایموجی {emoji} اضافه و انتخاب شد. پنل ایموجی اسم را دوباره باز کن.")
+            return True
         if mode == "add_name":
             if not text or len(text) > 40:
                 await event.reply("❌ اسم ۱ تا ۴۰ حرف."); return True
             if text in get_user_banners(user_id):
                 await event.reply(f"❌ بنر «{text}» وجود داره."); return True
-            pm_banner_states[user_id] = {"mode": "add_wait_media", "name": text, "prompt_chat_id": st.get("prompt_chat_id") or event.chat_id}
-            await event.reply(
+            next_state = {"mode": "add_wait_media", "name": text,
+                          "prompt_chat_id": st.get("prompt_chat_id") or event.chat_id}
+            next_prompt = (
                 f"✅ اسم: <b>{text}</b>\n\nحالا پیام/رسانه رو بفرست.\n"
                 f"<i>(متن، عکس، ویدیو، ویس، استیکر...)</i>\n\n"
-                f"🔴 لغو: <code>{CMD}لغو</code>", parse_mode="html")
+                f"🔴 لغو: <code>{CMD}لغو</code>")
+            sent = await event.reply(next_prompt, parse_mode="html")
+            _arm_banner_add_timeout(user_id, next_state, next_prompt,
+                                    getattr(sent, "id", None))
             return True
         if mode == "add_wait_media":
             name = st["name"]; banners = get_user_banners(user_id)
             if name in banners:
-                pm_banner_states.pop(user_id, None)
+                _clear_banner_add_state(user_id)
                 await event.reply("❌ این اسم ثبت شد."); return True
             btype, ext = _detect_banner_type(event.message)
             media_file = None
@@ -10028,7 +11941,7 @@ async def _pm_banner_state_input(event, user_id):
                 "created_at": datetime.now().isoformat(),
                 "reply_to_msg_id": None, "source_chat_id": None, "source_msg_id": None}
             save_json(BANNERS_FILE, banners_db)
-            pm_banner_states.pop(user_id, None)
+            _clear_banner_add_state(user_id)
             await event.reply(
                 f"✅ بنر «{name}» ساخته شد.\n📎 {_type_label(btype)}\n\n"
                 f"از پنل: 🎯 هدف، ⏱ بازه، 🟢 روشن.", parse_mode="html")
@@ -10036,7 +11949,7 @@ async def _pm_banner_state_input(event, user_id):
         if mode == "add_forward_wait":
             name = st["name"]; banners = get_user_banners(user_id)
             if name in banners:
-                pm_banner_states.pop(user_id, None)
+                _clear_banner_add_state(user_id)
                 await event.reply("❌ ثبت شد."); return True
             reply = await event.get_reply_message()
             if not reply:
@@ -10048,7 +11961,7 @@ async def _pm_banner_state_input(event, user_id):
                 "targets": [], "interval": 60, "active": False, "sent_count": 0,
                 "created_at": datetime.now().isoformat(), "reply_to_msg_id": None}
             save_json(BANNERS_FILE, banners_db)
-            pm_banner_states.pop(user_id, None)
+            _clear_banner_add_state(user_id)
             await event.reply(f"✅ بنر فوروارد «{name}» ساخته شد.\n📎 {_type_label(btype)}")
             return True
         if mode == "edit_name":
@@ -10129,10 +12042,13 @@ async def _pm_banner_state_input(event, user_id):
             
             if msg_id:
                 # ادیت کردن همون پیام پنل
-                await _try_inline_edit_global(msg_id, success_text, kb)
+                await _try_inline_edit_global(msg_id, success_text,
+                                              _bind_panel_callbacks(kb, user_id))
             else:
                 # اگر به هر دلیلی msg_id نبود
-                await event.reply(success_text, buttons=kb, parse_mode="html")
+                await event.reply(success_text,
+                                  buttons=_bind_panel_callbacks(kb, user_id),
+                                  parse_mode="html")
             return True
         if mode == "nosell_add":
             if not text:
@@ -10361,23 +12277,51 @@ async def _fishing_loop(user_id):
 # ═══════════════════════════════════════════════════════
 
 
+def _ensure_transfer_scheduler(user_id, kind):
+    """Start at most one hourly scheduler for each user and transfer category."""
+    uid = int(user_id)
+    if kind not in ("item", "material"):
+        return
+    key = (uid, kind)
+    task = transfer_scheduler_tasks.get(key)
+    if task and not task.done():
+        return
+    runner = item_scheduler if kind == "item" else material_scheduler
+    transfer_scheduler_tasks[key] = asyncio.create_task(runner(uid))
+
+
+def _ensure_enabled_transfer_schedulers(user_id):
+    uid = int(user_id)
+    if transfer_items_config.get(uid, {}).get("enabled"):
+        _ensure_transfer_scheduler(uid, "item")
+    if transfer_materials_config.get(uid, {}).get("enabled"):
+        _ensure_transfer_scheduler(uid, "material")
+
+
 async def item_scheduler(user_id):
+    key = (int(user_id), "item")
+    this_task = asyncio.current_task()
     try:
         while True:
             await asyncio.sleep(SELL_CHECK_INTERVAL) # هر 1 ساعت
             cfg = transfer_items_config.get(user_id, {})
             if not cfg.get("enabled"): break
             if sell_mode_users.get(user_id, {}).get("enabled"):
-                continue # اگر فروش روشنه، تسک فروش خودش مدیریت میکنه
+                continue # فروش، انتقال را در چرخهٔ خودش انجام می‌دهد
             async with get_user_lock(user_id):
                 await execute_item_transfers(user_id)
     except asyncio.CancelledError: pass
     except Exception as e: log_error(f"item_scheduler {user_id}: {_translate_bot_errors(e)}")
+    finally:
+        if transfer_scheduler_tasks.get(key) is this_task:
+            transfer_scheduler_tasks.pop(key, None)
 
 
 
 
 async def material_scheduler(user_id):
+    key = (int(user_id), "material")
+    this_task = asyncio.current_task()
     try:
         while True:
             await asyncio.sleep(SELL_CHECK_INTERVAL)
@@ -10389,6 +12333,9 @@ async def material_scheduler(user_id):
                 await execute_material_transfers(user_id)
     except asyncio.CancelledError: pass
     except Exception as e: log_error(f"material_scheduler {user_id}: {_translate_bot_errors(e)}")
+    finally:
+        if transfer_scheduler_tasks.get(key) is this_task:
+            transfer_scheduler_tasks.pop(key, None)
 
 
 
@@ -10427,6 +12374,7 @@ async def _pm_mat_state_input(event, user_id):
         return False
 
     async def edit_panel(new_text, new_kb, parse_mode=None):
+        new_kb = _bind_panel_callbacks(new_kb, user_id)
         success = False
         try:
             await event.client.edit_message(event.chat_id, event.reply_to_msg_id, new_text, buttons=new_kb, parse_mode=parse_mode)
@@ -10524,8 +12472,139 @@ async def _pm_mat_state_input(event, user_id):
     return False
 
 
-async def _dispatch_pn(event, user_id, data):
-    is_owner = False
+def _panel_is_owner(target_user_id, actor_id=None):
+    return is_grp_owner(target_user_id if actor_id is None else actor_id)
+
+
+def _panel_is_manager(target_user_id, actor_id=None):
+    return is_manager(target_user_id if actor_id is None else actor_id)
+
+
+async def _dispatch_pn(event, user_id, data, actor_id=None):
+    """گیت قفل بخش‌ها: هر دکمه/بخشی که مالک قفل کرده، برای کاربر اجرا نمی‌شود.
+
+    مالک (وقتی از پنل مالک داخل پنل کاربر است) از این گیت عبور می‌کند.
+    """
+    try:
+        acting_owner = (actor_id is not None and int(actor_id) != int(user_id)
+                        and is_grp_owner(actor_id))
+    except Exception:
+        acting_owner = False
+    key = str(data or "")
+    if key and not acting_owner and is_section_locked(user_id, key):
+        label = (get_locked_sections(user_id).get(key)
+                 or SECTION_LOCK_TITLES.get(key) or key)
+        return (f"🔒 «{label}» توسط مالک قفل شده است.\n"
+                f"برای بازکردنش با مالک هماهنگ کن.",
+                [[_cb("⚪ 🔙 بازگشت", "pn_refresh")]])
+    return await _dispatch_pn_core(event, user_id, data, actor_id=actor_id)
+
+
+async def _dispatch_pn_core(event, user_id, data, actor_id=None):
+    # Owner-only view-as-user panel: every nested control is executed for target,
+    # while the callback remains bound to the owner.
+    if data.startswith("pn_access_as_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try:
+            target_s, nested = data.replace("pn_access_as_", "", 1).split("_", 1)
+            target = int(target_s)
+        except (ValueError, IndexError):
+            return None
+        if nested == "pn_close":
+            return await _pm_build_user(user_id, target)
+        result = await _dispatch_pn(event, target, nested, actor_id=actor_id)
+        pending_state = pm_banner_states.get(target)
+        if pending_state is not None and actor_id is not None:
+            pending_state["panel_actor_id"] = int(actor_id)
+        return _pm_wrap_access_proxy_result(user_id, target, result, current_raw=nested)
+    if data.startswith("pn_access_seclk_"):
+        # قفل/بازکردن کل همین بخشی که مالک داخلش است
+        if not _panel_is_owner(user_id, actor_id): return None
+        rest = data.replace("pn_access_seclk_", "", 1)
+        target_s, _, panel_raw = rest.partition("_")
+        try: target = int(target_s)
+        except ValueError: return None
+        if is_grp_owner(target): return None
+        already = is_section_locked(target, panel_raw)
+        label = get_locked_sections(target).get(panel_raw) or _panel_lock_label(panel_raw)
+        set_section_locked(target, panel_raw, not already, label)
+        notice = (f"🔓 «{label}» باز شد." if already
+                  else f"🔒 «{label}» قفل شد و از پنل کاربر مخفی می‌شود.")
+        nested_result = await _dispatch_pn(event, target, panel_raw, actor_id=actor_id)
+        if nested_result is None:
+            return await _pm_build_access_editor(user_id, target, notice)
+        return _pm_wrap_access_proxy_result(user_id, target, nested_result, notice,
+                                            current_raw=panel_raw)
+    if data.startswith("pn_access_items_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        rest = data.replace("pn_access_items_", "", 1)
+        target_s, _, panel_raw = rest.partition("_")
+        try: target = int(target_s)
+        except ValueError: return None
+        return await _pm_build_access_item_menu(event, user_id, target, panel_raw)
+    if data.startswith("pn_access_item_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        rest = data.replace("pn_access_item_", "", 1)
+        parts = rest.split("_", 2)
+        if len(parts) < 3: return None
+        try:
+            target, idx = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        panel_raw = parts[2]
+        _panel_text, items = await _access_panel_items(event, target, panel_raw)
+        if not (0 <= idx < len(items)):
+            return await _pm_build_access_item_menu(event, user_id, target, panel_raw,
+                                                    "ℹ️ این دکمه دیگر در دسترس نیست.")
+        raw, label = items[idx]
+        now_locked = not is_section_locked(target, raw)
+        set_section_locked(target, raw, now_locked, label)
+        notice = (f"🔒 «{label}» قفل شد." if now_locked else f"🟢 «{label}» آزاد شد.")
+        return await _pm_build_access_item_menu(event, user_id, target, panel_raw, notice)
+    if data.startswith("pn_access_unlockall_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: target = int(data.replace("pn_access_unlockall_", "", 1))
+        except ValueError: return None
+        count = len(get_locked_sections(target))
+        clear_section_locks(target)
+        return await _pm_build_access_locks(
+            user_id, target, f"🔓 {count} قفل باز شد." if count else "ℹ️ قفلی وجود نداشت.")
+    if data.startswith("pn_access_unlk_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        rest = data.replace("pn_access_unlk_", "", 1)
+        target_s, _, lock_key = rest.partition("_")
+        try: target = int(target_s)
+        except ValueError: return None
+        label = get_locked_sections(target).get(lock_key, lock_key)
+        set_section_locked(target, lock_key, False)
+        return await _pm_build_access_locks(user_id, target, f"🟢 «{label}» آزاد شد.")
+    if data.startswith("pn_access_locks_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: target = int(data.replace("pn_access_locks_", "", 1))
+        except ValueError: return None
+        return await _pm_build_access_locks(user_id, target)
+    if data.startswith("pn_access_edit_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: target = int(data.replace("pn_access_edit_", "", 1))
+        except ValueError: return None
+        return await _pm_build_access_editor(user_id, target)
+    if data.startswith("pn_access_exit_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: target = int(data.replace("pn_access_exit_", "", 1))
+        except ValueError: return None
+        return await _pm_build_user(user_id, target)
+    if data.startswith("pn_access_lock_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: target = int(data.replace("pn_access_lock_", "", 1))
+        except ValueError: return None
+        if is_grp_owner(target): return None
+        current = bool(users_db.get("users", {}).get(str(target), {}).get("all_access_locked", False))
+        set_user_access_locked(target, not current)
+        if current:
+            try: _spawn(_restart_runtime_tasks())
+            except Exception: pass
+        notice = "🔒 دسترسی همهٔ بخش‌های کاربر قفل شد." if not current else "🔓 دسترسی کاربر باز شد."
+        return await _pm_build_access_editor(user_id, target, notice)
 
     # ═══════════ Hook: Transfer Panels ═══════════
     tr_res = await _dispatch_transfer_pn(event, user_id, data)
@@ -10539,13 +12618,12 @@ async def _dispatch_pn(event, user_id, data):
         
     if data.startswith("pn_notif_toggle_"):
         key = data.replace("pn_notif_toggle_", "")
-        key_map = {"mat": "mat_trans", "item": "item_trans", "sell": "sell"}
+        key_map = {"mat": "mat_trans", "item": "item_trans", "sell": "sell",
+                   "mon": "monitor", "emoji": "emoji_name"}
         actual_key = key_map.get(key, key)
-        
-        u = users_db["users"].get(str(user_id), {})
-        notifs = u.setdefault("notifications", {"mat_trans": True, "item_trans": True, "sell": True})
+        notifs = get_user_notifs(user_id)
         notifs[actual_key] = not notifs.get(actual_key, True)
-        save_json(USERS_FILE, users_db)
+        save_user_notifs(user_id)
         return await _pm_build_notif_panel(user_id)
 
 
@@ -10565,13 +12643,231 @@ async def _dispatch_pn(event, user_id, data):
         except Exception as e:
             log_error(f"pn_close: {_translate_bot_errors(e)}")
         return None
-    if data == "pn_refresh": return await _pm_build_main(user_id)
+    if data == "pn_refresh":
+        if actor_id is not None:
+            broadcast_waiting.pop(int(actor_id), None)
+        return await _pm_build_main(user_id)
     if data == "pn_status_panel": return await _pm_build_status_panel(user_id)
     if data == "pn_settings": return await _pm_build_settings_panel(user_id)
     if data == "pn_media_panel":
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         return await _pm_build_media_access_panel(user_id)
+    if data.startswith("pn_media_grant_list_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: page = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError): page = 0
+        return await _pm_build_media_grant_list(user_id, page)
+    if data.startswith("pn_media_grant_pick_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try:
+            target_s, page_s = data.replace("pn_media_grant_pick_", "", 1).rsplit("_", 1)
+            target, page = int(target_s), int(page_s)
+        except (ValueError, IndexError):
+            return await _pm_build_media_grant_list(user_id, 0)
+        return await _pm_build_media_grant_confirm(user_id, target, page)
+    if data.startswith("pn_media_grant_no_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: page = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError): page = 0
+        return await _pm_build_media_grant_list(user_id, page)
+    if data.startswith("pn_media_grant_yes_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try:
+            target_s, page_s = data.replace("pn_media_grant_yes_", "", 1).rsplit("_", 1)
+            target, page = int(target_s), int(page_s)
+        except (ValueError, IndexError):
+            return await _pm_build_media_grant_list(user_id, 0)
+        if (is_grp_owner(target) or str(target) not in users_db.get("users", {})
+                or is_media_allowed(target)):
+            return await _pm_build_media_grant_list(
+                user_id, page, "ℹ️ این کاربر دیگر برای افزودن در دسترس نیست."
+            )
+        set_media_allowed(target, True)
+        return await _pm_build_media_grant_list(
+            user_id, page, f"✅ دسترسی TTL/ذخیره به کاربر {target} داده شد."
+        )
+    if data.startswith("pn_media_remove_list_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: page = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError): page = 0
+        return await _pm_build_media_remove_list(user_id, page)
+    if data.startswith("pn_media_remove_pick_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try:
+            target_s, page_s = data.replace("pn_media_remove_pick_", "", 1).rsplit("_", 1)
+            target, page = int(target_s), int(page_s)
+        except (ValueError, IndexError):
+            return await _pm_build_media_remove_list(user_id, 0)
+        return await _pm_build_media_remove_confirm(user_id, target, page)
+    if data.startswith("pn_media_remove_no_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try: page = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError): page = 0
+        return await _pm_build_media_remove_list(user_id, page)
+    if data.startswith("pn_media_remove_yes_"):
+        if not _panel_is_owner(user_id, actor_id): return None
+        try:
+            target_s, page_s = data.replace("pn_media_remove_yes_", "", 1).rsplit("_", 1)
+            target, page = int(target_s), int(page_s)
+        except (ValueError, IndexError):
+            return await _pm_build_media_remove_list(user_id, 0)
+        if is_grp_owner(target):
+            return await _pm_build_media_remove_list(user_id, page, "⚠️ دسترسی مالک قابل حذف نیست.")
+        if not is_media_allowed(target):
+            return await _pm_build_media_remove_list(user_id, page, "ℹ️ این کاربر دیگر دسترسی ندارد.")
+        set_media_allowed(target, False)
+        return await _pm_build_media_remove_list(
+            user_id, page, f"✅ دسترسی کاربر {target} حذف شد و TTL خودکار خاموش شد."
+        )
     if data == "pn_tools": return await _pm_build_tools(user_id)
+    if data == "pn_mon_main":
+        if pm_banner_states.get(user_id, {}).get("mode") == "mon_add":
+            pm_banner_states.pop(user_id, None)
+        return await _pm_build_monitor_main(user_id)
+    if data == "pn_mon_add":
+        pm_banner_states[user_id] = {"mode": "mon_add", "prompt_chat_id": getattr(event, "chat_id", None)}
+        return (f"👁 آیدی یا @یوزرنیم فرد را بفرست.\nبرای افزودن با ریپلای، در گروه روی پیام فرد ریپلای کن و بنویس <code>{CMD}پایش افزودن</code>",
+                [[_cb("⚪ لغو", "pn_mon_main")]])
+    if data == "pn_mon_toggle_all":
+        cfg = monitor_db.setdefault(str(int(user_id)), {"enabled": False, "users": {}})
+        cfg["enabled"] = not cfg.get("enabled", False)
+        if cfg["enabled"]: start_monitor_task(user_id)
+        else: stop_monitor_task(user_id)
+        _save_monitor_db()
+        return await _pm_build_monitor_main(user_id)
+    if data.startswith("pn_mon_list_"):
+        try: page = int(data.replace("pn_mon_list_", "", 1))
+        except ValueError: page = 0
+        return await _pm_build_monitor_list(user_id, page)
+    if data.startswith("pn_mon_v_"):
+        target_id = data.replace("pn_mon_v_", "", 1)
+        return await _pm_build_monitor_view(user_id, target_id)
+    if data.startswith("pn_mon_t_"):
+        target_id = data.replace("pn_mon_t_", "", 1)
+        users = monitor_db.get(str(int(user_id)), {}).get("users", {})
+        if target_id in users:
+            users[target_id]["enabled"] = not users[target_id].get("enabled", True)
+            _save_monitor_db()
+        return await _pm_build_monitor_view(user_id, target_id)
+    if data.startswith("pn_mon_del_"):
+        target_id = data.replace("pn_mon_del_", "", 1)
+        users = monitor_db.get(str(int(user_id)), {}).get("users", {})
+        users.pop(target_id, None)
+        _save_monitor_db()
+        return await _pm_build_monitor_list(user_id, 0)
+    if data == "pn_random_profile_panel":
+        return await _pm_build_random_profile_panel(user_id)
+    if data == "pn_random_profile_toggle":
+        cfg = get_random_profile_config(user_id)
+        ok, message = await set_random_profile_enabled(user_id, not cfg.get("enabled", False))
+        text, kb = await _pm_build_random_profile_panel(user_id)
+        return (text if ok else message + "\n\n" + text), kb
+    if data.startswith("pn_random_profile_iv_"):
+        try: interval = int(data.rsplit("_", 1)[1])
+        except ValueError: interval = 60
+        if interval in (60, 300, 600):
+            get_random_profile_config(user_id)["interval"] = interval
+            save_json(USERS_FILE, users_db)
+        return await _pm_build_random_profile_panel(user_id)
+    if data == "pn_tts_panel":
+        if pm_banner_states.get(user_id, {}).get("mode", "").startswith("tts_"):
+            pm_banner_states.pop(user_id, None)
+        return await _pm_build_tts_panel(user_id)
+    if data == "pn_tts_cancel":
+        pm_banner_states.pop(user_id, None)
+        return await _pm_build_tts_panel(user_id)
+    if data == "pn_tts_text_start":
+        pm_banner_states[user_id] = {"mode": "tts_text_input", "prompt_chat_id": getattr(event, "chat_id", None)}
+        return ("📝 متن موردنظر را در پیام بعدی بفرست تا به ویس تبدیلش کنم.",
+                [[_cb("⚪ لغو", "pn_tts_cancel")]])
+    if data == "pn_tts_voice_start":
+        pm_banner_states[user_id] = {"mode": "tts_voice_wait", "prompt_chat_id": getattr(event, "chat_id", None)}
+        return ("🎧 ویس یا فایل صوتی را در پیام بعدی بفرست تا متنش را استخراج کنم.",
+                [[_cb("⚪ لغو", "pn_tts_cancel")]])
+    if data in ("pn_tts_set_female", "pn_tts_set_male"):
+        gender = "female" if data.endswith("female") else "male"
+        users_db.setdefault("users", {}).setdefault(str(int(user_id)), {})["voice_gender"] = gender
+        save_json(USERS_FILE, users_db)
+        return await _pm_build_tts_panel(user_id)
+    if data.startswith("pn_emoji_pos_"):
+        position = data.replace("pn_emoji_pos_", "", 1)
+        if position in ("start", "end"):
+            get_name_emoji_config(user_id)["position"] = position
+            save_json(USERS_FILE, users_db)
+        return await _pm_build_name_emoji_panel(user_id)
+    if data.startswith("pn_emoji_iv_"):
+        try: interval = int(data.replace("pn_emoji_iv_", "", 1))
+        except ValueError: interval = 60
+        if interval in (60, 300, 600):
+            cfg = get_name_emoji_config(user_id)
+            cfg["interval"] = interval
+            save_json(USERS_FILE, users_db)
+        return await _pm_build_name_emoji_panel(user_id)
+    if data == "pn_name_emoji_panel":
+        if pm_banner_states.get(user_id, {}).get("mode") == "name_emoji_add":
+            pm_banner_states.pop(user_id, None)
+        return await _pm_build_name_emoji_panel(user_id)
+    if data == "pn_name_emoji_cancel":
+        pm_banner_states.pop(user_id, None)
+        return await _pm_build_name_emoji_panel(user_id)
+    if data == "pn_name_emoji_add":
+        pm_banner_states[user_id] = {"mode": "name_emoji_add",
+            "prompt_chat_id": getattr(event, "chat_id", None)}
+        return ("➕ ایموجی دلخواه را بفرست. (نمونه: 🌟)",
+                [[_cb("⚪ لغو", "pn_name_emoji_cancel")]])
+    if data.startswith("pn_name_emoji_pick_"):
+        cfg = get_name_emoji_config(user_id)
+        all_emojis = list(dict.fromkeys(NAME_EMOJI_PRESETS + cfg.get("custom_emojis", [])))
+        try: idx = int(data.replace("pn_name_emoji_pick_", "", 1))
+        except ValueError: idx = -1
+        if 0 <= idx < len(all_emojis):
+            emoji = all_emojis[idx]
+            selected = list(cfg.get("emojis", []))
+            if emoji in selected: selected.remove(emoji)
+            else: selected.append(emoji)
+            cfg["emojis"] = selected
+            if cfg.get("enabled") and selected:
+                cfg["current_index"] = 0
+            if not selected and cfg.get("enabled"):
+                cfg["enabled"] = False
+                stop_name_emoji_task(user_id)
+                try: await _restore_original_profile_name(user_id)
+                except Exception as e: log_error(f"name emoji restore {user_id}: {_translate_bot_errors(e)}")
+            save_json(USERS_FILE, users_db)
+        return await _pm_build_name_emoji_panel(user_id)
+    if data == "pn_name_emoji_toggle":
+        cfg = get_name_emoji_config(user_id)
+        if cfg.get("enabled"):
+            cfg["enabled"] = False
+            stop_name_emoji_task(user_id)
+            try:
+                restored = await _restore_original_profile_name(user_id)
+                if not restored:
+                    log_error(f"name emoji restore: no client for {user_id}")
+            except Exception as e:
+                log_error(f"name emoji restore {user_id}: {_translate_bot_errors(e)}")
+        else:
+            if not cfg.get("emojis"):
+                return ("❌ اول حداقل یک ایموجی انتخاب کن.",
+                        [[_cb("🔙 بازگشت", "pn_name_emoji_panel")]])
+            try:
+                client = user_clients.get(int(user_id))
+                if not client or not client.is_connected():
+                    client = await ensure_user_client(user_id)
+                if not client:
+                    return ("❌ اتصال اکانت برقرار نیست.",
+                            [[_cb("🔙 بازگشت", "pn_name_emoji_panel")]])
+                me = await client.get_me()
+                cfg["original_first_name"] = getattr(me, "first_name", "") or ""
+                cfg["original_last_name"] = getattr(me, "last_name", "") or ""
+                cfg["profile_saved"] = True
+                cfg["enabled"] = True
+                start_name_emoji_task(user_id)
+            except Exception as e:
+                return (f"❌ روشن نشد: {_translate_bot_errors(e)}",
+                        [[_cb("🔙 بازگشت", "pn_name_emoji_panel")]])
+        save_json(USERS_FILE, users_db)
+        return await _pm_build_name_emoji_panel(user_id)
     if data == "pn_games": return await _pm_build_games(user_id)
     if data == "pn_cardinal_panel": return await _pm_build_cardinal_panel(user_id)
     if data == "pn_pew_panel": return await _pm_build_pew_panel(user_id)
@@ -10582,6 +12878,7 @@ async def _dispatch_pn(event, user_id, data):
     if data == "pn_sell_toggle":
         if user_id in sell_mode_users and sell_mode_users[user_id].get("enabled"):
             stop_sell_mode(user_id)
+            _ensure_enabled_transfer_schedulers(user_id)
         else:
             sell_mode_users[user_id] = {"enabled": True, "scheduler_task": None}
             sell_mode_users[user_id]["scheduler_task"] = asyncio.create_task(sell_scheduler(user_id))
@@ -10612,7 +12909,7 @@ async def _dispatch_pn(event, user_id, data):
     if data == "pn_return_panel":
         return await _pm_build_return_panel(user_id)
     if data == "pn_ret_check_floor":
-        asyncio.create_task(_force_floor_update(user_id))
+        _spawn(_force_floor_update(user_id))
         return ("⏳ در حال استعلام از بازی...\nلطفاً ۳ ثانیه صبر کنید و سپس دکمه زیر را بزنید.", [[_cb("🔄 مشاهده نتیجه", "pn_return_panel")]])
     if data == "pn_ret_toggle":
         return_config[user_id] = {"enabled": not is_return_enabled(user_id)}
@@ -10630,7 +12927,7 @@ async def _dispatch_pn(event, user_id, data):
         cfg["enabled"] = not cfg.get("enabled", False)
         schedule_save_runtime()
         if cfg["enabled"] and not sell_mode_users.get(user_id, {}).get("enabled"):
-            asyncio.create_task(material_scheduler(user_id))
+            _spawn(material_scheduler(user_id))
         return await _pm_build_materials_panel_v2(user_id)
         
     if data == "pn_mat_add":
@@ -10711,7 +13008,7 @@ async def _dispatch_pn(event, user_id, data):
         cfg["enabled"] = not cfg.get("enabled", False)
         schedule_save_runtime()
         if cfg["enabled"] and not sell_mode_users.get(user_id, {}).get("enabled"):
-            asyncio.create_task(item_scheduler(user_id))
+            _spawn(item_scheduler(user_id))
         return await _pm_build_items_panel(user_id)
         
     if data == "pn_item_add":
@@ -10791,10 +13088,10 @@ async def _dispatch_pn(event, user_id, data):
     if data == "pn_nosell_view": return await _pm_build_nosell_view(user_id)
     if data == "pn_nosell_add":
         pm_banner_states[user_id] = {"mode": "nosell_add", "prompt_chat_id": event.chat_id}
-        return (f"➕ افزودن نفروش\n━━━━━━━━━━━━━━━━━\n"
-                f"اسم آیتم‌ها رو بفرست:\n"
-                f"• یکی: <code>شمشیر</code>\n"
-                f"• چندتا: <code>شمشیر * سپر * زره</code>",
+        return ("➕ افزودن نفروش\n━━━━━━━━━━━━━━━━━\n"
+                "اسم آیتم‌ها رو بفرست:\n"
+                "• یکی: <code>شمشیر</code>\n"
+                "• چندتا: <code>شمشیر * سپر * زره</code>",
                 [[_cb("🔴 لغو", "pn_nosell_panel")]])
     if data.startswith("pn_nosell_remove_"):
         pg = int(data.replace("pn_nosell_remove_", "") or 0)
@@ -10837,10 +13134,14 @@ async def _dispatch_pn(event, user_id, data):
         if key != "none": set_user_font_on(user_id, True)
         return await _pm_build_font_panel(user_id)
     if data == "pn_ttl_toggle":
+        if not is_media_allowed(user_id):
+            return ("🔒 این بخش در دسترس نیست.", [[_cb("⚪ 🔙 بازگشت", "pn_tools")]])
         cfg = get_ttl_config(user_id)
         set_ttl_config(user_id, "enabled", not cfg["enabled"])
         return await _pm_build_ttl_panel(user_id)
     if data == "pn_ttl_reset_target":
+        if not is_media_allowed(user_id):
+            return ("🔒 این بخش در دسترس نیست.", [[_cb("⚪ 🔙 بازگشت", "pn_tools")]])
         set_ttl_config(user_id, "target", "me")
         return await _pm_build_ttl_panel(user_id)
     if data == "pn_gender_panel": return await _pm_build_gender_panel(user_id)
@@ -10887,23 +13188,23 @@ async def _dispatch_pn(event, user_id, data):
         else: set_user_banner_id(user_id, bid)
         return await _pm_build_banner_preview(user_id, bid)
     if data == "pn_owner":
-        if not (is_grp_owner(user_id) or is_manager(user_id)): return None
+        if not (_panel_is_owner(user_id, actor_id) or _panel_is_manager(user_id, actor_id)): return None
         return await _pm_build_owner_full(user_id)
     if data == "pn_managers":
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         return await _pm_build_managers_panel(user_id)
     if data.startswith("pn_users_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         pg = int(data.replace("pn_users_", "") or 0)
         return await _pm_build_users_full(user_id, pg)
     if data.startswith("pn_user_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = data.replace("pn_user_", "")
         try: tid = int(tid)
         except: return None
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_ban_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_ban_", ""))
         _ensure_user(str(tid))
         users_db["users"][str(tid)]["banned"] = True
@@ -10915,24 +13216,24 @@ async def _dispatch_pn(event, user_id, data):
         stop_all_pew_dog_for_user(tid); cancel_user_battle_tasks(tid)
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_unban_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_unban_", ""))
         _ensure_user(str(tid))
         users_db["users"][str(tid)]["banned"] = False
         save_json(USERS_FILE, users_db)
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_addmgr_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_addmgr_", ""))
         if not is_manager(tid): toggle_manager(tid)
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_rmmgr_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_rmmgr_", ""))
         if is_manager(tid): toggle_manager(tid)
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_rmsess_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_rmsess_", ""))
         sp = SESSION_DIR / str(tid)
         if os.path.exists(str(sp) + ".session"):
@@ -10942,11 +13243,11 @@ async def _dispatch_pn(event, user_id, data):
         await disconnect_user_client(tid)
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_reload_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_reload_", ""))
         return await _pm_build_user(user_id, tid)
     if data.startswith("pn_media_t_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         tid = int(data.replace("pn_media_t_", ""))
         if tid == OWNER_ID:
             return await _pm_build_user(user_id, tid)
@@ -10954,13 +13255,13 @@ async def _dispatch_pn(event, user_id, data):
         set_media_allowed(tid, not cur)
         return await _pm_build_user(user_id, tid)
     if data == "pn_broadcast":
-        if not is_grp_owner(user_id): return None
-        broadcast_waiting[user_id] = True
+        if not _panel_is_owner(user_id, actor_id): return None
+        broadcast_waiting[actor_id if actor_id is not None else user_id] = True
         return ("📢 پیام همگانی\n━━━━━━━━━━━━━━━━━\n"
                 "پیام یا ریپلای بفرست.\nلغو: <code>،لغو</code>",
                 [[_cb("🔴 لغو", "pn_refresh")]])
     if data == "pn_ping":
-        if not (is_grp_owner(user_id) or is_manager(user_id)): return None
+        if not (_panel_is_owner(user_id, actor_id) or _panel_is_manager(user_id, actor_id)): return None
         client = await ensure_user_client(user_id)
         if not client: return ("❌ اتصال نیست.", [[_cb("⚪ 🔙", "pn_owner")]])
         t0 = time.time()
@@ -10976,36 +13277,36 @@ async def _dispatch_pn(event, user_id, data):
                  f"🖥 {platform.system()}"]
         return ("\n".join(lines), [[_cb("🔄", "pn_ping"), _cb("⚪ 🔙", "pn_owner")]])
     if data == "pn_gb_panel":
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         return await _pm_build_gender_banners_panel(user_id)
     if data == "pn_gb_up_girl":
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         pm_banner_states[user_id] = {"mode": "gb_upload", "gender": "girl", "prompt_chat_id": event.chat_id}
         return ("🖼 آپلود بنر دخترانه\n━━━━━━━━━━━━━━━━━\nیه عکس بفرست.",
                 [[_cb("🔴 لغو", "pn_gb_panel")]])
     if data == "pn_gb_up_boy":
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         pm_banner_states[user_id] = {"mode": "gb_upload", "gender": "boy", "prompt_chat_id": event.chat_id}
         return ("🖼 آپلود بنر پسرانه\n━━━━━━━━━━━━━━━━━\nیه عکس بفرست.",
                 [[_cb("🔴 لغو", "pn_gb_panel")]])
     if data.startswith("pn_gb_list_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         rest = data.replace("pn_gb_list_", "")
         parts = rest.rsplit("_", 1)
         gender = parts[0]; pg = int(parts[1]) if len(parts) > 1 else 0
         return await _pm_build_gender_list(user_id, gender, pg)
     if data.startswith("pn_gb_view_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         bid = data.replace("pn_gb_view_", "")
         return await _pm_build_gender_view(user_id, bid)
     if data.startswith("pn_gb_del_yes_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         bid = data.replace("pn_gb_del_yes_", "")
         delete_gender_banner(bid)
         gender = "girl" if bid.startswith("girl_") else "boy"
         return await _pm_build_gender_list(user_id, gender, 0)
     if data.startswith("pn_gb_del_"):
-        if not is_grp_owner(user_id): return None
+        if not _panel_is_owner(user_id, actor_id): return None
         bid = data.replace("pn_gb_del_", "")
         return await _pm_build_gender_del_confirm(user_id, bid)
     if data == "pn_banner_main": return await _pm_build_banner_main(user_id)
@@ -11013,10 +13314,12 @@ async def _dispatch_pn(event, user_id, data):
         pg = int(data.replace("pn_banner_list_", "") or 0)
         return await _pm_build_banner_list(user_id, pg)
     if data == "pn_banner_add":
-        pm_banner_states[user_id] = {"mode": "add_name", "prompt_chat_id": event.chat_id}
-        return ("➕ بنر جدید\n━━━━━━━━━━━━━━━━━\n"
-                "اسم بنر رو بفرست:\n<i>مثال: پونی، فراخوان، اعلان</i>",
-                [[_cb("🔴 لغو", "pn_banner_main")]])
+        prompt = ("➕ بنر جدید\n━━━━━━━━━━━━━━━━━\n"
+                  "اسم بنر رو بفرست:\n<i>مثال: پونی، فراخوان، اعلان</i>")
+        state = {"mode": "add_name", "prompt_chat_id": event.chat_id}
+        _arm_banner_add_timeout(user_id, state, prompt,
+                                getattr(getattr(event, "query", None), "msg_id", None))
+        return (prompt, [[_cb("🔴 لغو", "pn_banner_cancel")]])
     if data.startswith("pn_banner_editpick_"):
         bname = data.replace("pn_banner_editpick_", "")
         return await _pm_build_banner_edit_menu(user_id, bname)
@@ -11155,14 +13458,73 @@ async def _dispatch_pn(event, user_id, data):
             save_json(BANNERS_FILE, banners_db)
         return await _pm_build_banner_targets(user_id, bname)
     if data == "pn_banner_done": return await _pm_build_banner_main(user_id)
-    if data == "pn_banner_cancel": return await _pm_build_banner_main(user_id)
+    if data == "pn_banner_cancel":
+        _clear_banner_add_state(user_id)
+        return await _pm_build_banner_main(user_id)
+    if data == "pn_tools_naz":
+        cid = pm_panel_chat.get(int(user_id))
+        if cid is not None:
+            return await _pm_build_naz_auto_panel(user_id, int(cid))
+        return ("💞 اول گروه موردنظر را انتخاب کن تا «ناز» در همان گروه فرستاده شود.",
+                [[_cb("🔀 انتخاب گروه", "pn_pony_pick")],
+                 [_cb("⚪ 🔙 بازگشت به ابزارها", "pn_tools")]])
+    if data == "pn_pony_main": return await _pm_build_pony_main(user_id)
     if data == "pn_pony_pick": return await _pm_build_pony_pick(user_id)
     if data.startswith("pn_pony_pg_"):
         pg = int(data.replace("pn_pony_pg_", "") or 0)
         return await _pm_build_pony_pick(user_id, pg)
     if data.startswith("pn_pony_sel_"):
         cid = int(data.replace("pn_pony_sel_", ""))
+        pm_panel_chat[int(user_id)] = cid
+        schedule_save_runtime()
         return await _pm_build_pony_panel(user_id, cid)
+    if data.startswith("pn_pony_naz_panel_"):
+        cid = int(data.replace("pn_pony_naz_panel_", "", 1))
+        return await _pm_build_naz_auto_panel(user_id, cid)
+    if data.startswith("pn_pony_naz_interval_"):
+        raw = data.replace("pn_pony_naz_interval_", "", 1)
+        try:
+            cid_str, minutes_str = raw.rsplit("_", 1)
+            cid, minutes = int(cid_str), int(minutes_str)
+        except (TypeError, ValueError):
+            return ("❌ بازه نامعتبر است.", [[_cb("⚪ 🔙 بازگشت", "pn_pony_main")]])
+        if minutes not in (3, 5):
+            return ("❌ بازه نامعتبر است.", [[_cb("⚪ 🔙 بازگشت", f"pn_pony_naz_panel_{cid}")]])
+        cfg = get_pony_cfg(user_id, cid)
+        cfg["naz_interval_mins"] = minutes
+        pm_panel_chat[int(user_id)] = cid
+        schedule_save_runtime()
+        return await _pm_build_naz_auto_panel(user_id, cid)
+    if data.startswith("pn_pony_naz_toggle_"):
+        cid = int(data.replace("pn_pony_naz_toggle_", "", 1))
+        cfg = get_pony_cfg(user_id, cid)
+        cfg.setdefault("naz_interval_mins", 3)
+        cfg["naz_enabled"] = not cfg.get("naz_enabled", False)
+        pm_panel_chat[int(user_id)] = cid
+        if cfg["naz_enabled"]:
+            start_naz_auto_task(user_id, cid)
+        else:
+            stop_naz_auto_task(user_id, cid)
+        schedule_save_runtime()
+        return await _pm_build_naz_auto_panel(user_id, cid)
+    if data.startswith("pn_pony_ctrl_"):
+        cid = int(data.replace("pn_pony_ctrl_", ""))
+        return await _pm_build_pony_ctrl(user_id, cid)
+    if data.startswith("pn_pony_interval_"):
+        raw = data.replace("pn_pony_interval_", "", 1)
+        try:
+            cid_str, minutes_str = raw.rsplit("_", 1)
+            cid, minutes = int(cid_str), int(minutes_str)
+        except (TypeError, ValueError):
+            return ("❌ بازه نامعتبر است.", [[_cb("⚪ 🔙 بازگشت", "pn_pony_main")]])
+        if minutes not in (5, 10, 15, 20):
+            return ("❌ بازه نامعتبر است.", [[_cb("⚪ 🔙 بازگشت", f"pn_pony_ctrl_{cid}")]])
+        cfg = get_pony_cfg(user_id, cid)
+        cfg["interval_mins"] = minutes
+        pony_config[(int(user_id), cid)] = cfg
+        pm_panel_chat[int(user_id)] = cid
+        schedule_save_runtime()
+        return await _pm_build_pony_ctrl(user_id, cid)
     if data.startswith("pn_pony_t_"):
         cid = int(data.replace("pn_pony_t_", ""))
         cfg = pony_config.get((int(user_id), cid), {"collect": False, "upgrade": False})
@@ -11177,7 +13539,7 @@ async def _dispatch_pn(event, user_id, data):
             start_pony_task(user_id, cid)
         pony_config[(int(user_id), cid)] = cfg
         schedule_save_runtime()
-        return await _pm_build_pony_panel(user_id, cid)
+        return await _pm_build_pony_ctrl(user_id, cid)
     if data.startswith("pn_up_t_"):
         cid = int(data.replace("pn_up_t_", ""))
         cfg = pony_config.get((int(user_id), cid), {"collect": False, "upgrade": False})
@@ -11252,11 +13614,6 @@ async def _dispatch_pn(event, user_id, data):
         pew_art_stats[int(user_id)] = {"grabbed": 0, "missed": 0}
         schedule_save_runtime()
         return await _pm_build_pew_art_panel(user_id)
-    if data == "pn_boss_toggle":
-        cur = pew_boss_config.get(int(user_id), {}).get("enabled", False)
-        pew_boss_config[int(user_id)] = {"enabled": not cur}
-        schedule_save_runtime()
-        return await _pm_build_pew_panel(user_id)
     if data == "pn_pewring_master_panel": return await _pm_build_pewring_master_panel(user_id)
     if data.startswith("pn_pewring_page_"):
         pg = int(data.replace("pn_pewring_page_", "") or 0)
@@ -11375,7 +13732,7 @@ async def _dispatch_pn(event, user_id, data):
         members = grp.get("members", [])
         disabled = grp.get("disabled_users", [])
         is_owner = (grp.get("owner") == user_id)
-        role_txt = "👑 سازنده" if is_grp_owner else "👤 عضو"
+        role_txt = "👑 سازنده" if is_owner else "👤 عضو"
         user_active = user_id not in disabled
         st_txt = "🟢 روشن" if user_active else "🔴 خاموش"
         
@@ -11423,7 +13780,7 @@ async def _dispatch_pn(event, user_id, data):
         return ("🗑 چه کسی را اخراج کنیم؟", kb)
     if data.startswith("pn_ghunt_kick_") and not data.startswith("pn_ghunt_kick_yes_") and data != "pn_ghunt_kick_list":
         target = int(data.split("_")[-1])
-        return (f"⚠️ آیا از اخراج این کاربر مطمئنید؟", [
+        return ("⚠️ آیا از اخراج این کاربر مطمئنید؟", [
             [_cb("✅ بله", f"pn_ghunt_kick_yes_{target}")],
             [_cb("🔴 لغو", "pn_ghunt_mgmt")]
         ])
@@ -11449,7 +13806,7 @@ async def _dispatch_pn(event, user_id, data):
         return ("👑 چه کسی سازنده جدید شود؟", kb)
     if data.startswith("pn_ghunt_prom_") and not data.startswith("pn_ghunt_prom_yes_") and data != "pn_ghunt_prom_list":
         target = int(data.split("_")[-1])
-        return (f"⚠️ آیا از انتقال سازندگی مطمئنید؟", [
+        return ("⚠️ آیا از انتقال سازندگی مطمئنید؟", [
             [_cb("✅ بله", f"pn_ghunt_prom_yes_{target}")],
             [_cb("🔴 لغو", "pn_ghunt_mgmt")]
         ])
@@ -11602,6 +13959,7 @@ async def helper_inline_handler(event):
             return
 
         text, kb = await _pm_build_main(user_id)
+        kb = _bind_panel_callbacks(kb, user_id)
         markup = _kb_to_inline_markup(kb)
 
         try:
@@ -11613,34 +13971,38 @@ async def helper_inline_handler(event):
         from telethon.tl.types import (
             InputBotInlineResult, InputBotInlineMessageText,
             InputBotInlineMessageMediaAuto, InputMediaUploadedPhoto,
-            InputMediaEmpty,
         )
 
         banner = get_user_display_banner(user_id)
 
-        if banner and os.path.exists(banner):
-            # ─── با عکس ───
+        # ─── با عکس ───
+        # نکته: InputBotInlineMessageMediaAuto در تلگرام پارامتر media نمی‌گیرد
+        # (مدیای نتیجهٔ اینلاین باید URL باشد، نه فایل محلی). قبلاً همین‌جا
+        # همیشه TypeError می‌خورد و بنر پنل هیچ‌وقت نمایش داده نمی‌شد.
+        # حالا فقط اگر نسخهٔ کتابخانه پشتیبانی کند تلاش می‌کنیم، وگرنه بی‌صدا
+        # پنل متنی فرستاده می‌شود (بدون خطای تکراری در لاگ).
+        send_msg = InputBotInlineMessageText(
+            message=msg_text,
+            entities=entities or None,
+            reply_markup=markup)
+        if banner and os.path.exists(banner) and _INLINE_MEDIA_SUPPORTED:
             try:
                 uploaded = await helper_bot.upload_file(banner)
-                media = InputMediaUploadedPhoto(file=uploaded, ttl_seconds=None)
+                _media_kw = {"media": InputMediaUploadedPhoto(
+                    file=uploaded, ttl_seconds=None)}
                 send_msg = InputBotInlineMessageMediaAuto(
                     message=msg_text,
                     entities=entities or None,
                     reply_markup=markup,
-                    media=media,
+                    **_media_kw,
                 )
                 log_error(f"📸 inline with photo for {user_id}")
             except Exception as ue:
-                log_error(f"upload banner fail: {ue}")
+                log_error(f"inline banner fallback to text: {_translate_bot_errors(ue)}")
                 send_msg = InputBotInlineMessageText(
                     message=msg_text,
                     entities=entities or None,
                     reply_markup=markup)
-        else:
-            send_msg = InputBotInlineMessageText(
-                message=msg_text,
-                entities=entities or None,
-                reply_markup=markup)
 
         result = InputBotInlineResult(
             id="1", type="article",
@@ -11663,29 +14025,57 @@ async def helper_callback_handler(event):
         data = event.data.decode() if event.data else ""
     except Exception:
         return
-    if not data.startswith("pn_"):
-        try: await event.answer()
+    actor_id = event.query.user_id
+    if not data.startswith("pc_"):
+        # Older or unbound panel buttons are rejected rather than risking cross-account actions.
+        try:
+            if data.startswith("pn_"):
+                await event.answer("⚠️ این دکمه منقضی است؛ پنل را دوباره باز کن.", alert=True)
+            else:
+                await event.answer()
         except: pass
         return
-    user_id = event.query.user_id
+    binding = panel_callback_tokens.get(data)
+    if not binding or time.time() - binding[2] > 8 * 3600:
+        panel_callback_tokens.pop(data, None)
+        try: await event.answer("⚠️ این دکمه منقضی است؛ پنل را دوباره باز کن.", alert=True)
+        except: pass
+        return
+    user_id, data, _created_at = binding
+    if int(actor_id) != int(user_id) and not is_grp_owner(actor_id):
+        try: await event.answer("❌ این پنل فقط برای صاحبش قابل استفاده است.", alert=True)
+        except: pass
+        return
     if data.startswith(("pn_owner", "pn_users_", "pn_user_", "pn_ban_",
                         "pn_unban_", "pn_addmgr_", "pn_rmmgr_", "pn_rmsess_",
-                        "pn_reload_", "pn_managers", "pn_gb_", "pn_broadcast")):
-        if not is_grp_owner(user_id):
+                        "pn_reload_", "pn_managers", "pn_gb_", "pn_broadcast",
+                        "pn_media_remove_", "pn_media_grant_", "pn_access_")):
+        if not is_grp_owner(actor_id):
             try: await event.answer("❌ دسترسی", alert=True)
             except: pass
             return
     if not is_user_active(user_id):
-        try: await event.answer("❌ اول لاگین کن", alert=True)
+        try: await event.answer("❌ این حساب فعال نیست.", alert=True)
         except: pass
         return
+    if not is_user_allowed(user_id):
+        try: await event.answer("🔒 دسترسی این حساب توسط مالک قفل شده است.", alert=True)
+        except: pass
+        return
+    state_before = repr(pm_banner_states.get(user_id))
     try:
-        result = await _dispatch_pn(event, user_id, data)
+        result = await _dispatch_pn(event, user_id, data, actor_id=actor_id)
     except Exception as e:
         log_error(f"_dispatch_pn {user_id}/{data}: {_translate_bot_errors(e)}")
         try: await event.answer(f"❌ {_translate_bot_errors(e)}", alert=True)
         except: pass
         return
+    state_after = pm_banner_states.get(user_id)
+    if state_after is not None and repr(state_after) != state_before:
+        if int(actor_id) != int(user_id):
+            state_after["panel_actor_id"] = int(actor_id)
+        else:
+            state_after.pop("panel_actor_id", None)
     if result is None:
         try: await event.answer()
         except: pass
@@ -11699,72 +14089,63 @@ async def helper_callback_handler(event):
         try: await event.answer()
         except: pass
         return
+    kb = _bind_panel_callbacks(kb, user_id)
     try: imid = event.query.msg_id
     except: imid = None
-    is_inline_msg = _is_inline_id(imid)
+    # Inline callbacks carry no normal peer; some Telethon versions expose
+    # their message id as an int, so check the query kind as well as the id.
+    is_inline_msg = _is_inline_id(imid) or getattr(event.query, "peer", None) is None
 
-    cl = user_clients.get(int(user_id))
-    if not cl or not cl.is_connected():
-        cl = await ensure_user_client(user_id)
-
+    # Inline panel messages are edited only through the helper bot. Never fall back
+    # to sending a duplicate into Saved Messages or the current chat.
     try:
-        # حالت ۱: پیام inline بدون عکس → inline edit سریع
-        if is_inline_msg and not file_path:
-            ok = await _try_inline_edit_global(imid, text, kb)
-            if ok:
-                try: await event.answer()
-                except: pass
-                return
-
-        # حالت ۲: اگه inline هست → inline edit
         if is_inline_msg:
             ok = await _try_inline_edit_global(imid, text, kb)
             if ok:
                 log_error(f"✅ inline edited: {imid}")
                 try: await event.answer()
                 except: pass
-                return
+            else:
+                try: await event.answer("❌ پنل به‌روزرسانی نشد؛ دوباره پنل را باز کن.", alert=True)
+                except: pass
+            return
 
-        # حالت ۳: پیام خودت هست → edit_message
+        cl = user_clients.get(int(user_id))
+        if not cl or not cl.is_connected():
+            cl = await ensure_user_client(user_id)
+        kwargs = {"buttons": kb, "parse_mode": "html"}
+        if file_path:
+            if os.path.exists(file_path): kwargs["file"] = file_path
+            else: text += "\n\n<i>⚠️ عکس پیدا نشد</i>"
+
+        # Non-inline panels are edited in place; no delete-and-send duplicate fallback.
         if cl:
             try:
-                kwargs = {"buttons": kb, "parse_mode": "html"}
                 await cl.edit_message(event.chat_id, imid, text, **kwargs)
                 log_error(f"✅ edited same msg: {imid}")
                 try: await event.answer()
                 except: pass
                 return
             except Exception as ee:
-                log_error(f"edit same failed: {ee}")
+                log_error(f"edit same failed: {_translate_bot_errors(ee)}")
 
-        # حالت ۴: اگه edit نشد، delete + send new
-        if cl:
-            try:
-                await cl.delete_messages(event.chat_id, [imid])
-            except Exception as de:
-                log_error(f"del panel: {de}")
-            kwargs = {"buttons": kb, "parse_mode": "html"}
-            if file_path:
-                if os.path.exists(file_path):
-                    kwargs["file"] = file_path
-                else:
-                    text = text + "\n\n<i>⚠️ عکس پیدا نشد</i>"
-            try:
-                await cl.send_message(event.chat_id, text, **kwargs)
-                try: await event.answer()
-                except: pass
-                return
-            except Exception as se:
-                log_error(f"send panel: {se}")
-
-        # fallback helper
         try:
-            kwargs = {"buttons": kb, "parse_mode": "html"}
-            if file_path: kwargs["file"] = file_path
             await event.edit(text, **kwargs)
+            try: await event.answer()
+            except: pass
+            return
         except Exception as e:
-            log_error(f"cb helper fallback: {_translate_bot_errors(e)}")
-        try: await event.answer()
+            log_error(f"callback edit failed: {_translate_bot_errors(e)}")
+        # تلاش دوم با متن ساده (بدون HTML) تا پنل به‌هرحال آپدیت شود
+        try:
+            plain = html_lib.unescape(re.sub(r"<[^>]+>", "", str(text or "")))
+            await event.edit(plain, buttons=kb)
+            try: await event.answer()
+            except: pass
+            return
+        except Exception as e:
+            log_error(f"callback plain edit failed: {_translate_bot_errors(e)}")
+        try: await event.answer("❌ نتوانستم همین پیام پنل را به‌روزرسانی کنم؛ پنل را دوباره باز کن.", alert=True)
         except: pass
     except Exception as e:
         log_error(f"helper_callback_handler update: {_translate_bot_errors(e)}")
@@ -12147,11 +14528,13 @@ async def _dispatch_transfer_pn(event, user_id, data):
         cfg["enabled"] = not cfg.get("enabled", False)
         schedule_save_runtime()
         if cfg["enabled"]:
+            _ensure_transfer_scheduler(user_id, "material")
             if not sell_mode_users.get(user_id, {}).get("enabled"):
-                asyncio.create_task(material_scheduler(user_id))
-            async def _run_imm_mat(uid):
-                async with get_user_lock(uid): await execute_material_transfers(uid)
-            asyncio.create_task(_run_imm_mat(user_id))
+                async def _run_imm_mat(uid):
+                    async with get_user_lock(uid):
+                        if not sell_mode_users.get(uid, {}).get("enabled"):
+                            await execute_material_transfers(uid)
+                _spawn(_run_imm_mat(user_id))
         return await _pm_build_materials_panel_v2(user_id)
     
     if data == "pn_mat_add":
@@ -12225,11 +14608,13 @@ async def _dispatch_transfer_pn(event, user_id, data):
         cfg["enabled"] = not cfg.get("enabled", False)
         schedule_save_runtime()
         if cfg["enabled"]:
+            _ensure_transfer_scheduler(user_id, "item")
             if not sell_mode_users.get(user_id, {}).get("enabled"):
-                asyncio.create_task(item_scheduler(user_id))
-            async def _run_imm_item(uid):
-                async with get_user_lock(uid): await execute_item_transfers(uid)
-            asyncio.create_task(_run_imm_item(user_id))
+                async def _run_imm_item(uid):
+                    async with get_user_lock(uid):
+                        if not sell_mode_users.get(uid, {}).get("enabled"):
+                            await execute_item_transfers(uid)
+                _spawn(_run_imm_item(user_id))
         return await _pm_build_items_panel(user_id)
     
     if data == "pn_item_add":
@@ -12300,6 +14685,19 @@ async def _dispatch_transfer_pn(event, user_id, data):
     return None
 
 
+def extract_floor_generic(text):
+    if not text: return None
+    t = _normalize_persian(normalize_digits(text))
+    m = re.search(r'موقعیت\s*فعلی[:\s]*طبقه\s*(\d+)', t)
+    if m: return int(m.group(1))
+    m = re.search(r'بیرون\s*از\s*شهر\s*-\s*طبقه\s*(\d+)', t)
+    if m: return int(m.group(1))
+    m = re.search(r'شهر\s*طبقه\s*(\d+)', t)
+    if m: return int(m.group(1))
+    m = re.search(r'طبقه\s*فعلی[:\s]*(\d+)', t)
+    if m: return int(m.group(1))
+    return None
+
 async def main():
     global bot_client
     print("🚀 starting...")
@@ -12335,8 +14733,8 @@ async def main():
                 if c: print(f"  🔌 revived {uid}")
         except Exception as e:
             log_error(f"revive {uid_s}: {_translate_bot_errors(e)}")
-    asyncio.create_task(_restart_runtime_tasks())
-    asyncio.create_task(notify_users_on_startup())
+    _spawn(_restart_runtime_tasks())
+    _spawn(notify_users_on_startup())
     print("✅ ready.")
     await bot_client.run_until_disconnected()
 
@@ -12348,16 +14746,3 @@ if __name__ == "__main__":
     except Exception as e:
         log_error(f"main crash: {_translate_bot_errors(e)}")
         print(f"❌ {_translate_bot_errors(e)}")
-def extract_floor_generic(text):
-    if not text: return None
-    t = _normalize_persian(normalize_digits(text))
-    m = re.search(r'موقعیت\s*فعلی[:\s]*طبقه\s*(\d+)', t)
-    if m: return int(m.group(1))
-    m = re.search(r'بیرون\s*از\s*شهر\s*-\s*طبقه\s*(\d+)', t)
-    if m: return int(m.group(1))
-    m = re.search(r'شهر\s*طبقه\s*(\d+)', t)
-    if m: return int(m.group(1))
-    m = re.search(r'طبقه\s*فعلی[:\s]*(\d+)', t)
-    if m: return int(m.group(1))
-    return None
-
